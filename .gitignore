@@ -1,6 +1,7 @@
-```text
-   build/
-   dist/
-   *.spec
-   __pycache__/
-   .venv/
+build/
+dist/
+Output/
+cache/
+*.spec
+__pycache__/
+.venv/
