@@ -1414,7 +1414,7 @@ class BreedingEngine:
         layers_desc: List[List[BreedingNode]] = [top]  # kx31, (k-1)x31, ... 1x31
 
         curr = top
-        for _layer_size in range(k, 1, -1):
+        for _ in range(k, 1, -1):
             parents: List[BreedingNode] = []
             for child in curr:
                 ivs = list(child.ivs)
@@ -1463,7 +1463,7 @@ class BreedingEngine:
 
         if not nature_selected:
             pure_layers = self._build_pure_layers(selected_stats)
-            for li, layer in enumerate(pure_layers):
+            for layer in pure_layers:
                 for i, n in enumerate(layer):
                     n.gender = "M" if i % 2 == 0 else "H"
                     n.branch_role = "primary"
@@ -1525,7 +1525,7 @@ class BreedingEngine:
             for layer_idx in range(len(layers) - 1):
                 parents = layers[layer_idx]
                 children = layers[layer_idx + 1]
-                for child_idx, child in enumerate(children):
+                for child_idx in range(len(children)):
                     ia = 2 * child_idx
                     ib = ia + 1
                     if ib >= len(parents):
@@ -2277,11 +2277,6 @@ class App(tk.Tk):
             highlightthickness=1, highlightbackground=self.theme["border"]
         )
         self.notes_box.grid(row=7, column=0, sticky="nsew", padx=12, pady=(0, 12))
-
-    # After building all panels, finish grid of IV checkboxes
-    # This method is no longer used; IV checkboxes are gridded directly in _build_left.
-    def _finish_layout(self):
-        pass
 
     # ---------- Data load ----------
     def _load_data_async(self):
@@ -3565,7 +3560,6 @@ class App(tk.Tk):
         content_w = layout["content_w"]
         content_h = layout["content_h"]
         margin_y = layout["margin_y"]
-        node_h = layout["node_h"]
         junction_x = layout["junction_x"]
         fusion_points = layout.get("fusion_points", {})
 
@@ -3816,5 +3810,6 @@ if __name__ == "__main__":
         user_assets_dir=ASSETS_DIR,
         enable_updater=True,
     )
+
 
 

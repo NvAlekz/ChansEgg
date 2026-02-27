@@ -5,3 +5,4 @@ cache/
 *.spec
 __pycache__/
 .venv/
+share_page.html
