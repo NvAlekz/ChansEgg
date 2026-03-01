@@ -1,4 +1,4 @@
-import os
+﻿import os
 import sys
 import tkinter as tk
 from pathlib import Path
@@ -59,7 +59,7 @@ class Splash(tk.Toplevel):
 def run_app(
     app_factory: Callable[[], tk.Tk],
     ensure_assets: Optional[Callable[[], None]] = None,
-    app_version: str = "1.0.0",
+    app_version: str = "1.0.1",
     updater_config_path: str = "",
     splash_duration_ms: int = 1200,
     runtime_assets_dir: str = "",

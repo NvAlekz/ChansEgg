@@ -1,5 +1,5 @@
-#define MyAppName "ChansEgg"
-#define MyAppVersion "1.0.0"
+﻿#define MyAppName "ChansEgg"
+#define MyAppVersion "1.0.1"
 #define MyAppPublisher "ChansEgg"
 #define MyAppExeName "ChansEgg.exe"
 
@@ -24,7 +24,7 @@ Name: "spanish"; MessagesFile: "compiler:Languages\Spanish.isl"
 Name: "desktopicon"; Description: "Crear icono en el escritorio"; GroupDescription: "Iconos:"; Flags: unchecked
 
 [Files]
-Source: "dist\ChansEgg\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "dist\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

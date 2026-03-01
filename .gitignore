@@ -6,3 +6,4 @@ cache/
 __pycache__/
 .venv/
 share_page.html
+SUMMARY_GITHUB.txt

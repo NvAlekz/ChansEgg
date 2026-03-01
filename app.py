@@ -1,21 +1,44 @@
 ﻿import os, sys, json, threading, re, hashlib, shutil
 from dataclasses import dataclass, field
+import logging
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
+
+try:
+    import customtkinter as ctk
+    HAS_CTK = True
+except Exception:
+    ctk = None
+    HAS_CTK = False
 
 import requests
 from PIL import Image, ImageDraw, ImageFont, ImageTk
+from inventory import (
+    InventoryItem,
+    InventoryMatcher,
+    InventoryRequirement,
+    InventorySettings,
+    InventoryStore,
+    STAT_KEYS,
+    calculate_stats,
+    normalize_nature_name,
+    normalize_stat_key,
+)
 
 
 # =========================
 # Paths / Config
 # =========================
 APP_NAME = "ChansEgg"
+LOGGER = logging.getLogger("chansegg")
+if not LOGGER.handlers:
+    logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
 
 @dataclass(frozen=True)
@@ -28,6 +51,7 @@ class AppPaths:
     runtime_default_sprite: Path
     runtime_braces_dir: Path
     runtime_type_icon_dir: Path
+    runtime_locales_dir: Path
     user_cache_dir: Path
     user_config_dir: Path
     user_data_dir: Path
@@ -37,6 +61,7 @@ class AppPaths:
     user_type_icon_cache_dir: Path
     user_braces_dir: Path
     user_type_icon_dir: Path
+    user_locales_dir: Path
     user_data_json: Path
     user_filter_json: Path
     user_default_sprite: Path
@@ -76,6 +101,7 @@ def build_app_paths() -> AppPaths:
         runtime_default_sprite=runtime_assets_dir / "default.png",
         runtime_braces_dir=runtime_assets_dir / "braces",
         runtime_type_icon_dir=runtime_assets_dir / "type_icons",
+        runtime_locales_dir=runtime_base / "locales",
         user_cache_dir=user_cache_dir,
         user_config_dir=user_config_dir,
         user_data_dir=user_data_dir,
@@ -85,6 +111,7 @@ def build_app_paths() -> AppPaths:
         user_type_icon_cache_dir=user_cache_dir / "type_icons",
         user_braces_dir=user_cache_dir / "braces",
         user_type_icon_dir=user_assets_dir / "type_icons",
+        user_locales_dir=user_base / "locales",
         user_data_json=user_data_dir / "pokemon.json",
         user_filter_json=user_data_dir / "pokemmo_species.json",
         user_default_sprite=user_assets_dir / "default.png",
@@ -123,6 +150,7 @@ def ensure_user_dirs_and_migrate(paths: AppPaths) -> None:
         paths.user_type_icon_cache_dir,
         paths.user_braces_dir,
         paths.user_type_icon_dir,
+        paths.user_locales_dir,
     ):
         p.mkdir(parents=True, exist_ok=True)
 
@@ -132,6 +160,7 @@ def ensure_user_dirs_and_migrate(paths: AppPaths) -> None:
     _copy_if_missing(paths.runtime_default_sprite, paths.user_default_sprite)
     _copytree_if_missing(paths.runtime_type_icon_dir, paths.user_type_icon_dir)
     _copytree_if_missing(paths.runtime_braces_dir, paths.user_braces_dir)
+    _copytree_if_missing(paths.runtime_locales_dir, paths.user_locales_dir)
 
     # Legacy migration from previous writable app layout.
     legacy_base = Path(__file__).resolve().parent
@@ -163,6 +192,7 @@ RUNTIME_FILTER_PATH = str(APP_PATHS.runtime_filter_json)
 RUNTIME_DEFAULT_SPRITE_PATH = str(APP_PATHS.runtime_default_sprite)
 RUNTIME_BRACES_DIR = str(APP_PATHS.runtime_braces_dir)
 RUNTIME_TYPE_ICON_DIR = str(APP_PATHS.runtime_type_icon_dir)
+RUNTIME_LOCALES_DIR = str(APP_PATHS.runtime_locales_dir)
 
 DATA_JSON_PATH = str(APP_PATHS.user_data_json)
 POKEMMO_SPECIES_PATH = str(APP_PATHS.user_filter_json)
@@ -175,8 +205,12 @@ BRACES_DIR = str(APP_PATHS.user_braces_dir)
 TYPE_ICON_DIR = str(APP_PATHS.user_type_icon_dir)
 TYPE_ICON_CACHE_DIR = str(APP_PATHS.user_type_icon_cache_dir)
 DEFAULT_SPRITE_PATH = str(APP_PATHS.user_default_sprite)
-APP_VERSION = "1.0.0"
+LOCALES_DIR = str(APP_PATHS.user_locales_dir)
+APP_VERSION = "1.0.1"
 UPDATER_CONFIG_PATH = os.path.join(CONFIG_DIR, "updater.json")
+UI_CONFIG_PATH = os.path.join(CONFIG_DIR, "ui.json")
+INVENTORY_JSON_PATH = os.path.join(str(APP_PATHS.user_data_dir), "inventory.json")
+INVENTORY_SETTINGS_PATH = os.path.join(CONFIG_DIR, "inventory_settings.json")
 
 STATS = ["HP", "Atk", "Def", "SpA", "SpD", "Spe"]
 
@@ -261,6 +295,69 @@ TYPE_COLORS = {
     "dark": "#705746",
     "steel": "#B7B7CE",
     "fairy": "#D685AD",
+}
+
+TYPE_NAMES_LOCALIZED = {
+    "es": {
+        "normal": "Normal",
+        "fire": "Fuego",
+        "water": "Agua",
+        "electric": "Eléctrico",
+        "grass": "Planta",
+        "ice": "Hielo",
+        "fighting": "Lucha",
+        "poison": "Veneno",
+        "ground": "Tierra",
+        "flying": "Volador",
+        "psychic": "Psíquico",
+        "bug": "Bicho",
+        "rock": "Roca",
+        "ghost": "Fantasma",
+        "dragon": "Dragón",
+        "dark": "Siniestro",
+        "steel": "Acero",
+        "fairy": "Hada",
+    },
+    "en": {
+        "normal": "Normal",
+        "fire": "Fire",
+        "water": "Water",
+        "electric": "Electric",
+        "grass": "Grass",
+        "ice": "Ice",
+        "fighting": "Fighting",
+        "poison": "Poison",
+        "ground": "Ground",
+        "flying": "Flying",
+        "psychic": "Psychic",
+        "bug": "Bug",
+        "rock": "Rock",
+        "ghost": "Ghost",
+        "dragon": "Dragon",
+        "dark": "Dark",
+        "steel": "Steel",
+        "fairy": "Fairy",
+    },
+    "zh": {
+        "normal": "一般",
+        "fire": "火",
+        "water": "水",
+        "electric": "电",
+        "grass": "草",
+        "ice": "冰",
+        "fighting": "格斗",
+        "poison": "毒",
+        "ground": "地面",
+        "flying": "飞行",
+        "psychic": "超能力",
+        "bug": "虫",
+        "rock": "岩石",
+        "ghost": "幽灵",
+        "dragon": "龙",
+        "dark": "恶",
+        "steel": "钢",
+        "fairy": "妖精",
+    },
 }
 
 PALETTES = {
@@ -353,6 +450,11 @@ class PaletteDefinition:
     tones: List[str]
 
 
+@dataclass
+class UIConfig:
+    language: str = "es"
+
+
 class ThemeManager:
     def __init__(self, config_path: str = THEME_CONFIG_PATH):
         self.config_path = config_path
@@ -404,31 +506,41 @@ class ThemeManager:
         tones = PALETTES.get(cfg.palette, PALETTES["Verde oscuro"])
         t1, t2, t3, t4, t5 = tones
         if cfg.mode == "dark":
-            bg = self._mix(t1, "#000000", 0.25)
-            panel = self._mix(t1, t2, 0.35)
-            panel_alt = self._mix(t1, t2, 0.55)
-            fg = self._mix(t5, "#FFFFFF", 0.05)
-            muted = self._mix(t4, t3, 0.45)
-            border = self._mix(t2, t3, 0.50)
-            entry_bg = self._mix(t1, "#000000", 0.35)
-            canvas_bg = self._mix(t1, "#000000", 0.45)
-            grid = self._mix(t2, "#000000", 0.45)
-            accent = t3
-            node_fill = self._mix(t1, "#1A2536", 0.40)
-            nature_fill = self._mix(t2, "#593106", 0.50)
+            # Strong readability in dark mode with palette-derived accents.
+            bg = self._mix("#0B0F16", t1, 0.24)
+            panel = self._mix("#121A26", t2, 0.26)
+            panel_alt = self._mix("#162131", t3, 0.26)
+            fg = "#EDF3FB"
+            muted = self._mix("#B7C2D2", t4, 0.20)
+            border = self._mix("#44556B", t3, 0.30)
+            entry_bg = self._mix(panel, bg, 0.46)
+            canvas_bg = self._mix(bg, "#070A0F", 0.38)
+            grid = self._mix(border, canvas_bg, 0.58)
+            accent = self._mix(self._mix(t3, t4, 0.55), "#E6EEF9", 0.20)
+            node_fill = self._mix(panel_alt, "#23354C", 0.28)
+            nature_fill = self._mix(self._mix(t1, t3, 0.56), "#7B4B1B", 0.32)
+            node_shadow = self._mix(canvas_bg, "#000000", 0.46)
+            edge_pure = self._mix(self._mix(t3, t4, 0.50), "#D7E4F7", 0.16)
+            edge_fusion = self._mix(self._mix(t2, t4, 0.56), "#D7E4F7", 0.20)
+            edge_nature = self._mix(self._mix(t1, t3, 0.56), "#E9D3A3", 0.18)
         else:
-            bg = self._mix(t5, "#FFFFFF", 0.30)
-            panel = self._mix(t4, "#FFFFFF", 0.25)
-            panel_alt = self._mix(t4, t5, 0.45)
-            fg = self._mix(t1, "#000000", 0.15)
-            muted = self._mix(t2, t3, 0.30)
-            border = self._mix(t3, t2, 0.45)
-            entry_bg = self._mix(t5, "#FFFFFF", 0.10)
-            canvas_bg = self._mix(t5, t4, 0.10)
-            grid = self._mix(t4, t3, 0.35)
-            accent = self._mix(t2, t3, 0.45)
-            node_fill = self._mix(t5, t4, 0.10)
-            nature_fill = self._mix(t3, t4, 0.35)
+            # Strong readability in light mode, avoiding washed-out white surfaces.
+            bg = self._mix("#F0F4FA", t5, 0.26)
+            panel = self._mix("#E7EDF6", t4, 0.30)
+            panel_alt = self._mix("#DEE6F2", t3, 0.24)
+            fg = "#13243A"
+            muted = self._mix("#5A6C84", t2, 0.14)
+            border = self._mix("#A9B9CD", t3, 0.30)
+            entry_bg = self._mix("#FFFFFF", t5, 0.08)
+            canvas_bg = self._mix("#F4F8FF", t5, 0.22)
+            grid = self._mix("#C3D1E6", t3, 0.26)
+            accent = self._mix(self._mix(t2, t3, 0.48), "#1B3858", 0.20)
+            node_fill = self._mix("#FFFFFF", panel_alt, 0.36)
+            nature_fill = self._mix(self._mix(t4, t5, 0.48), "#ECD3B4", 0.30)
+            node_shadow = self._mix(panel_alt, "#6E7E95", 0.24)
+            edge_pure = self._mix(self._mix(t3, t2, 0.54), "#31597E", 0.18)
+            edge_fusion = self._mix(self._mix(t2, t4, 0.52), "#2D4F73", 0.18)
+            edge_nature = self._mix(self._mix(t1, t3, 0.52), "#8A6336", 0.18)
 
         return {
             "bg": bg,
@@ -442,14 +554,15 @@ class ThemeManager:
             "listbox_bg": entry_bg,
             "listbox_fg": fg,
             "listbox_sel_bg": accent,
-            "listbox_sel_fg": fg,
+            "listbox_sel_fg": "#081018" if cfg.mode == "light" else "#F8FAFF",
             "canvas_bg": canvas_bg,
             "grid": grid,
             "node_fill": node_fill,
             "nature_fill": nature_fill,
-            "edge_pure": "#00BFFF" if cfg.mode == "dark" else self._mix(t2, t3, 0.65),
-            "edge_fusion": "#00D9FF" if cfg.mode == "dark" else self._mix(t3, t2, 0.70),
-            "edge_nature": "#FF8C00" if cfg.mode == "dark" else self._mix("#CC6A00", t2, 0.30),
+            "node_shadow": node_shadow,
+            "edge_pure": edge_pure,
+            "edge_fusion": edge_fusion,
+            "edge_nature": edge_nature,
             "iv_off_bg": self._mix(entry_bg, panel, 0.25),
             "iv_off_fg": muted,
             "accent": accent,
@@ -463,6 +576,67 @@ class ThemeManager:
             "info_table_row_alt_bg": self._mix(entry_bg, panel_alt, 0.12),
             "info_bar_bg": self._mix(entry_bg, panel, 0.20),
         }
+
+
+class I18nManager:
+    SUPPORTED = ("es", "en", "zh")
+
+    def __init__(self, user_locales_dir: str = LOCALES_DIR, runtime_locales_dir: str = RUNTIME_LOCALES_DIR, config_path: str = UI_CONFIG_PATH):
+        self.user_locales_dir = user_locales_dir
+        self.runtime_locales_dir = runtime_locales_dir
+        self.config_path = config_path
+        self._cache: Dict[str, Dict[str, str]] = {}
+
+    def load_ui_config(self) -> UIConfig:
+        if not os.path.exists(self.config_path):
+            cfg = UIConfig()
+            self.save_ui_config(cfg)
+            return cfg
+        try:
+            with open(self.config_path, "r", encoding="utf-8-sig") as f:
+                data = json.load(f)
+            lang = str(data.get("language", "es")).strip().lower()
+            if lang not in self.SUPPORTED:
+                lang = "en"
+            return UIConfig(language=lang)
+        except Exception as exc:
+            LOGGER.debug("Invalid UI config at %s: %s", self.config_path, exc)
+            return UIConfig(language="en")
+
+    def save_ui_config(self, cfg: UIConfig) -> None:
+        os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
+        with open(self.config_path, "w", encoding="utf-8") as f:
+            json.dump({"language": cfg.language}, f, ensure_ascii=False, indent=2)
+
+    def _load_lang(self, lang: str) -> Dict[str, str]:
+        if lang in self._cache:
+            return self._cache[lang]
+        candidates = [
+            os.path.join(self.runtime_locales_dir, f"{lang}.json"),
+            os.path.join(self.user_locales_dir, f"{lang}.json"),
+        ]
+        for path in candidates:
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8-sig") as f:
+                    data = json.load(f)
+                flat = {str(k): str(v) for k, v in (data or {}).items()}
+                self._cache[lang] = flat
+                return flat
+            except Exception as exc:
+                LOGGER.debug("Invalid locale file %s: %s", path, exc)
+        self._cache[lang] = {}
+        return self._cache[lang]
+
+    def t(self, lang: str, key: str, **kwargs) -> str:
+        primary = self._load_lang(lang).get(key, "")
+        if not primary:
+            primary = self._load_lang("en").get(key, key)
+        try:
+            return primary.format(**kwargs)
+        except Exception:
+            return primary
 
 
 # =========================
@@ -628,9 +802,9 @@ class SpeciesInfoService:
         "speed": "Spe",
     }
     MOVE_METHOD_LABELS = {
-        "level-up": "Nivel",
-        "egg": "Huevo",
-        "machine": "MT/MO",
+        "level-up": "Level",
+        "egg": "Egg",
+        "machine": "TM/HM",
         "tutor": "Tutor",
     }
     VERSION_REGION_HINT = {
@@ -661,11 +835,11 @@ class SpeciesInfoService:
         self._species_payload: Dict[int, dict] = {}
         self._types_cache: Dict[int, List[str]] = {}
         self._pokemon_payload: Dict[int, dict] = {}
-        self._detail_cache: Dict[Tuple[int, str], dict] = {}
+        self._detail_cache: Dict[Tuple[int, str, str], dict] = {}
         self._url_payload_cache: Dict[str, dict] = {}
         self._move_payload_cache: Dict[str, dict] = {}
         self._encounter_cache: Dict[Tuple[int, str], List[dict]] = {}
-        self._evolution_cache: Dict[int, List[List[dict]]] = {}
+        self._evolution_cache: Dict[Tuple[int, str], List[List[dict]]] = {}
         self._location_cache: Dict[str, str] = {}
         self._machine_item_cache: Dict[str, str] = {}
 
@@ -674,6 +848,27 @@ class SpeciesInfoService:
         if not name:
             return "—"
         return name.replace("-", " ").title()
+
+    @staticmethod
+    def _localized_payload_name(payload: dict, language: str, fallback: str = "—") -> str:
+        lang = (language or "en").strip().lower()
+        if lang == "zh":
+            order = ("zh-Hans", "zh-Hant", "zh", "en", "es")
+        elif lang == "es":
+            order = ("es", "en", "zh-Hans", "zh-Hant")
+        else:
+            order = ("en", "es", "zh-Hans", "zh-Hant")
+        names = payload.get("names", []) or []
+        for wanted in order:
+            wanted_l = wanted.lower()
+            for row in names:
+                row_lang = str((row.get("language", {}) or {}).get("name", "")).strip().lower()
+                if row_lang != wanted_l:
+                    continue
+                n = str(row.get("name", "") or "").strip()
+                if n:
+                    return n
+        return fallback
 
     @staticmethod
     def _extract_id_from_url(url: str) -> Optional[int]:
@@ -764,11 +959,19 @@ class SpeciesInfoService:
     def _versions_for_group(self, version_group: str) -> set:
         return set(self.VERSION_GROUP_TO_VERSIONS.get(version_group, {version_group}))
 
-    def _get_flavor_text(self, species: dict) -> str:
+    def _get_flavor_text(self, species: dict, language: str = "en") -> str:
         entries = species.get("flavor_text_entries", []) or []
-        for lang in ("es", "en"):
+        lang = (language or "en").strip().lower()
+        if lang == "zh":
+            order = ("zh-hans", "zh-hant", "zh", "en", "es")
+        elif lang == "es":
+            order = ("es", "en", "zh-hans", "zh-hant")
+        else:
+            order = ("en", "es", "zh-hans", "zh-hant")
+        for wanted_lang in order:
             for row in entries:
-                if row.get("language", {}).get("name") != lang:
+                row_lang = str((row.get("language", {}) or {}).get("name", "")).strip().lower()
+                if row_lang != wanted_lang:
                     continue
                 raw = (row.get("flavor_text", "") or "").replace("\n", " ").replace("\f", " ").strip()
                 if raw:
@@ -807,7 +1010,7 @@ class SpeciesInfoService:
         self._machine_item_cache[machine_url] = item_name
         return item_name
 
-    def _build_moves(self, pokemon: dict, version_group: str) -> List[dict]:
+    def _build_moves(self, pokemon: dict, version_group: str, language: str = "en") -> List[dict]:
         rows: List[dict] = []
         seen = set()
         move_entries: List[Tuple[str, str, List[dict]]] = []
@@ -819,7 +1022,7 @@ class SpeciesInfoService:
             ]
             if not vg_details:
                 continue
-            move_name = self._pretty_name(m.get("move", {}).get("name", ""))
+            move_name = m.get("move", {}).get("name", "")
             move_url = m.get("move", {}).get("url", "")
             move_entries.append((move_name, move_url, vg_details))
 
@@ -860,8 +1063,13 @@ class SpeciesInfoService:
                     except Exception:
                         machine_item_by_url[mu] = ""
 
-        for move_name, move_url, vg_details in move_entries:
+        for raw_move_name, move_url, vg_details in move_entries:
             move_payload = payload_by_url.get(move_url, {})
+            move_name = self._localized_payload_name(
+                move_payload,
+                language=language,
+                fallback=self._pretty_name(raw_move_name),
+            )
             move_type = move_payload.get("type", {}).get("name", "")
             power = move_payload.get("power")
             pp = move_payload.get("pp")
@@ -886,14 +1094,14 @@ class SpeciesInfoService:
                 learn_bucket = "other"
                 if method_key == "level-up":
                     learn_bucket = "level"
-                    method_level = f"Nv. {level}"
+                    method_level = f"Lv. {level}"
                 elif method_key == "egg":
                     learn_bucket = "egg"
-                    method_level = "Huevo"
+                    method_level = "Egg"
                 elif method_key == "machine":
                     is_hm = machine_item.lower().startswith("hm")
                     learn_bucket = "hm" if is_hm else "tm"
-                    method_label = "MO" if is_hm else "MT"
+                    method_label = "HM" if is_hm else "TM"
                     method_level = method_label
                 elif method_key == "tutor":
                     learn_bucket = "tutor"
@@ -1017,55 +1225,90 @@ class SpeciesInfoService:
         self._encounter_cache[key] = rows
         return rows
 
-    def _format_evolution_trigger(self, detail: dict) -> str:
+    def _format_evolution_trigger(self, detail: dict, language: str = "en") -> str:
         if not detail:
             return "—"
+        lang = (language or "en").strip().lower()
+        evo_i18n = {
+            "es": {
+                "lvl": "Nv. {n}",
+                "use": "Usar {v}",
+                "holding": "Sosteniendo {v}",
+                "happiness": "Felicidad {n}+",
+                "know": "Con {v}",
+                "at": "En {v}",
+                "trade": "Intercambio",
+                "shed": "Espacio + Pokeball",
+            },
+            "en": {
+                "lvl": "Lv. {n}",
+                "use": "Use {v}",
+                "holding": "Holding {v}",
+                "happiness": "Happiness {n}+",
+                "know": "Knows {v}",
+                "at": "At {v}",
+                "trade": "Trade",
+                "shed": "Space + Pokeball",
+            },
+            "zh": {
+                "lvl": "Lv. {n}",
+                "use": "使用 {v}",
+                "holding": "携带 {v}",
+                "happiness": "亲密度 {n}+",
+                "know": "已学会 {v}",
+                "at": "在 {v}",
+                "trade": "通信交换",
+                "shed": "空位 + 精灵球",
+            },
+        }
+        tr = evo_i18n.get(lang, evo_i18n["en"])
         # PokeAPI often returns null in nested fields (item, held_item, etc.).
         # Always normalize to dict before .get("name").
         min_level = detail.get("min_level")
         if min_level:
-            return f"Nv. {min_level}"
+            return tr["lvl"].format(n=min_level)
         item = (detail.get("item") or {}).get("name")
         if item:
-            return f"Usar {self._pretty_name(item)}"
+            return tr["use"].format(v=self._pretty_name(item))
         held_item = (detail.get("held_item") or {}).get("name")
         if held_item:
-            return f"Sosteniendo {self._pretty_name(held_item)}"
+            return tr["holding"].format(v=self._pretty_name(held_item))
         min_happiness = detail.get("min_happiness")
         if min_happiness:
-            return f"Felicidad {min_happiness}+"
+            return tr["happiness"].format(n=min_happiness)
         known_move = (detail.get("known_move") or {}).get("name")
         if known_move:
-            return f"Con {self._pretty_name(known_move)}"
+            return tr["know"].format(v=self._pretty_name(known_move))
         location = (detail.get("location") or {}).get("name")
         if location:
-            return f"En {self._pretty_name(location)}"
+            return tr["at"].format(v=self._pretty_name(location))
         time_of_day = detail.get("time_of_day", "")
         if time_of_day:
             return self._pretty_name(time_of_day)
         trigger = (detail.get("trigger") or {}).get("name", "")
         if trigger == "trade":
-            return "Intercambio"
+            return tr["trade"]
         if trigger == "shed":
-            return "Espacio + Pokeball"
+            return tr["shed"]
         if trigger:
             return self._pretty_name(trigger)
         return "—"
 
-    def _get_evolution_paths(self, species_id: int, species_payload: dict) -> List[List[dict]]:
-        if species_id in self._evolution_cache:
-            return self._evolution_cache[species_id]
+    def _get_evolution_paths(self, species_id: int, species_payload: dict, language: str = "en") -> List[List[dict]]:
+        cache_key = (species_id, (language or "en").strip().lower())
+        if cache_key in self._evolution_cache:
+            return self._evolution_cache[cache_key]
         chain_url = (species_payload.get("evolution_chain") or {}).get("url", "")
         if not chain_url:
             base = [[{"species_id": species_id, "name": self._pretty_name(species_payload.get("name", "")), "trigger_text": ""}]]
-            self._evolution_cache[species_id] = base
+            self._evolution_cache[cache_key] = base
             return base
         try:
             chain_payload = self._fetch_json_url(chain_url)
         except Exception as exc:
             print(f"[SpeciesInfoService] evolution chain failed for #{species_id}: {exc}")
             base = [[{"species_id": species_id, "name": self._pretty_name(species_payload.get("name", "")), "trigger_text": ""}]]
-            self._evolution_cache[species_id] = base
+            self._evolution_cache[cache_key] = base
             return base
 
         paths: List[List[dict]] = []
@@ -1085,8 +1328,8 @@ class SpeciesInfoService:
                 return
             for child in evolves:
                 details = child.get("evolution_details", []) or [{}]
-                trigger_texts = [self._format_evolution_trigger(d) for d in details if d]
-                trigger = " / ".join([t for t in trigger_texts if t and t != "—"]) or "Evoluciona"
+                trigger_texts = [self._format_evolution_trigger(d, language=language) for d in details if d]
+                trigger = " / ".join([t for t in trigger_texts if t and t != "—"]) or "Evolves"
                 walk(child, trigger, next_current)
 
         root = chain_payload.get("chain", {}) or {}
@@ -1094,11 +1337,12 @@ class SpeciesInfoService:
 
         if not paths:
             paths = [[{"species_id": species_id, "name": self._pretty_name(species_payload.get("name", "")), "trigger_text": ""}]]
-        self._evolution_cache[species_id] = paths
+        self._evolution_cache[cache_key] = paths
         return paths
 
-    def get_pokemon_details(self, species_id: int, version_group: str = "black-white") -> dict:
-        key = (species_id, version_group)
+    def get_pokemon_details(self, species_id: int, version_group: str = "black-white", language: str = "en") -> dict:
+        lang = (language or "en").strip().lower()
+        key = (species_id, version_group, lang)
         if key in self._detail_cache:
             return self._detail_cache[key]
 
@@ -1125,12 +1369,12 @@ class SpeciesInfoService:
                 }
             )
 
-        moves = self._build_moves(pokemon, version_group)
+        moves = self._build_moves(pokemon, version_group, language=lang)
         level_moves = sorted({(m["level"], m["name"]) for m in moves if m["method_key"] == "level-up"}, key=lambda x: (x[0], x[1]))
         egg_moves = sorted({m["name"] for m in moves if m["method_key"] == "egg"})
         machine_moves = sorted({m["name"] for m in moves if m["method_key"] == "machine"})
         encounters = self._get_encounters(species_id, version_group)
-        evolution_chain = self._get_evolution_paths(species_id, species)
+        evolution_chain = self._get_evolution_paths(species_id, species, language=lang)
         sites_fallback_used = any(bool(x.get("is_fallback")) for x in encounters)
 
         hidden_ability = "—"
@@ -1145,7 +1389,7 @@ class SpeciesInfoService:
             "id": species_id,
             "types": self.get_types(species_id),
             "egg_groups": self.get_egg_groups(species_id),
-            "flavor_text": self._get_flavor_text(species),
+            "flavor_text": self._get_flavor_text(species, language=lang),
             "height_m": (self._safe_int(pokemon.get("height", 0), 0) / 10.0),
             "weight_kg": (self._safe_int(pokemon.get("weight", 0), 0) / 10.0),
             "capture_rate": self._safe_int(species.get("capture_rate", 0), 0),
@@ -1787,10 +2031,20 @@ class DarkTheme:
 # =========================
 # App
 # =========================
-class App(tk.Tk):
+BaseTkApp = ctk.CTk if HAS_CTK else tk.Tk
+
+
+class App(BaseTkApp):
     def __init__(self):
         super().__init__()
-        self.title("ChansEgg")
+        self._use_ctk = bool(HAS_CTK)
+        if not self._use_ctk:
+            LOGGER.warning("customtkinter not installed. Falling back to Tk widgets.")
+        self.i18n = I18nManager()
+        self.ui_cfg = self.i18n.load_ui_config()
+        self._lang = self.ui_cfg.language if self.ui_cfg.language in I18nManager.SUPPORTED else "en"
+        self._ui_font_family = self._resolve_ui_font_family(self._lang)
+        self.title(f"ChansEgg v{APP_VERSION}")
         # Set an initial geometry and a minimum size
         self.geometry("1150x680")
         # Set a minimum size to avoid UI breakage on small windows
@@ -1798,7 +2052,12 @@ class App(tk.Tk):
         self.theme_manager = ThemeManager()
         self.theme_cfg = self.theme_manager.load()
         self.theme = self.theme_manager.build_theme(self.theme_cfg)
-        self.configure(bg=self.theme["bg"])
+        if self._use_ctk:
+            ctk.set_appearance_mode("Dark" if self.theme_cfg.mode == "dark" else "Light")
+            ctk.set_default_color_theme("blue")
+            self.configure(fg_color=self.theme["bg"])
+        else:
+            self.configure(bg=self.theme["bg"])
 
         self.repo = Repo()
         self.species_info = SpeciesInfoService()
@@ -1806,6 +2065,11 @@ class App(tk.Tk):
         self.type_icons = TypeIconService()
         self.brace_sprites = BraceSpriteService()
         self.engine = BreedingEngine()
+        self.inventory_store = InventoryStore(INVENTORY_JSON_PATH, INVENTORY_SETTINGS_PATH)
+        self.inventory_matcher = InventoryMatcher()
+        self.inventory_items: List[InventoryItem] = self.inventory_store.load_items()
+        self.inventory_settings: InventorySettings = self.inventory_store.load_settings()
+        self._last_inventory_report = None
 
         self.items: List[PokemonEntry] = []
         self.filtered: List[PokemonEntry] = []
@@ -1814,6 +2078,7 @@ class App(tk.Tk):
         self.nature_var = tk.StringVar(value=NATURE_NONE)
         self.theme_palette_var = tk.StringVar(value=self.theme_cfg.palette)
         self.theme_mode_var = tk.StringVar(value=self.theme_cfg.mode)
+        self.language_var = tk.StringVar(value=self._lang.upper())
         self.keep_nature = tk.BooleanVar(value=False)  # reserved for future
         self.compatible_var = tk.BooleanVar(value=False)
         self.iv_vars: Dict[str, tk.BooleanVar] = {s: tk.BooleanVar(value=False) for s in STATS}
@@ -1823,8 +2088,9 @@ class App(tk.Tk):
         self._brace_icons: Dict[str, ImageTk.PhotoImage] = {}
         self._everstone_icon: Optional[ImageTk.PhotoImage] = None
         self._name_type_text_var = tk.StringVar(value="—")
-        self._egg_groups_var = tk.StringVar(value="Grupos Huevo: —")
+        self._egg_groups_var = tk.StringVar(value="")
         self._zoom_scale: float = 1.0
+        self._selection_generation_id: int = 0
         self._zoom_min: float = 0.45
         self._zoom_max: float = 2.8
         self._is_panning: bool = False
@@ -1851,23 +2117,105 @@ class App(tk.Tk):
         self._info_images: List[ImageTk.PhotoImage] = []
         self._info_loading_label: Optional[tk.Label] = None
         self._last_plan: Optional[BreedingPlan] = None
+        self._last_render_meta: Optional[Dict[str, object]] = None
         self._resize_after_id: Optional[str] = None
+        self._recompute_after_id: Optional[str] = None
+        self._recompute_debounce_ms: int = 180
+        self._render_generation_id: int = 0
+        self._render_inflight: bool = False
+        self._graph_tag = "graph"
+        self._status_var = tk.StringVar(value=f"v{APP_VERSION}")
+        self._app_icon_img: Optional[ImageTk.PhotoImage] = None
+        self._inventory_window = None
+        self._inventory_canvas = None
+        self._inventory_box_label_var = tk.StringVar(value="Box 1")
+        self._inventory_selected_item_id: Optional[str] = None
+        self._inventory_box_index: int = 0
+        self._inventory_slots_per_box: int = 40
+        self._inventory_cols: int = 8
+        self._inventory_rows: int = 5
+        self._inventory_slot_size: int = 84
+        self._inventory_drag: Dict[str, object] = {}
+        self._inventory_images: Dict[str, ImageTk.PhotoImage] = {}
+        self._inventory_form_vars: Dict[str, object] = {}
+        self._inventory_price_vars: Dict[int, tk.StringVar] = {}
+        self._inventory_stats_vars: Dict[str, tk.StringVar] = {}
 
         self._setup_style()
+        self._apply_app_icon()
         self._build_layout()
         self._apply_theme(refresh_canvas=False)
+        self._apply_language()
         self._show_default_sprite()
         self._load_brace_icons_async()
         self._load_data_async()
 
+    def t(self, key: str, **kwargs) -> str:
+        return self.i18n.t(self._lang, key, **kwargs)
+
+    def _localize_type_name(self, type_key: str) -> str:
+        key = (type_key or "").strip().lower()
+        if not key:
+            return "—"
+        lang_map = TYPE_NAMES_LOCALIZED.get(self._lang, TYPE_NAMES_LOCALIZED["en"])
+        return lang_map.get(key, TYPE_NAMES_LOCALIZED["en"].get(key, key.title()))
+
+    def _resolve_ui_font_family(self, lang: str) -> str:
+        if lang == "zh":
+            preferred = ("Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", "SimHei", "Segoe UI")
+        else:
+            preferred = ("Segoe UI", "Roboto", "Arial", "Microsoft YaHei")
+        try:
+            families = set(tkfont.families(self))
+            for fam in preferred:
+                if fam in families:
+                    return fam
+        except Exception:
+            pass
+        return "Segoe UI"
+
+    def _set_status(self, key_or_text: str, *, is_key: bool = False, **kwargs) -> None:
+        text = self.t(key_or_text, **kwargs) if is_key else key_or_text
+        self._status_var.set(text)
+
+    def _apply_app_icon(self) -> None:
+        ico_candidates = [
+            os.path.join(RUNTIME_ASSETS_DIR, "chansegg.ico"),
+            os.path.join(ASSETS_DIR, "chansegg.ico"),
+        ]
+        for ico in ico_candidates:
+            if not os.path.exists(ico):
+                continue
+            try:
+                self.iconbitmap(ico)
+                return
+            except Exception:
+                pass
+
+        png_candidates = [
+            os.path.join(RUNTIME_ASSETS_DIR, "chansegg.png"),
+            os.path.join(ASSETS_DIR, "chansegg.png"),
+        ]
+        for png in png_candidates:
+            if not os.path.exists(png):
+                continue
+            try:
+                img = Image.open(png).convert("RGBA").resize((32, 32), Image.LANCZOS)
+                self._app_icon_img = ImageTk.PhotoImage(img)
+                self.iconphoto(False, self._app_icon_img)
+                return
+            except Exception:
+                pass
+
     # ---------- Styling ----------
     def _setup_style(self):
         style = ttk.Style(self)
+        base_font = self._ui_font_family
         try:
             style.theme_use("clam")
         except Exception:
             pass
-        style.configure(".", background=self.theme["bg"], foreground=self.theme["fg"], fieldbackground=self.theme["panel"], font=("Segoe UI", 10))
+        style.configure(".", background=self.theme["bg"], foreground=self.theme["fg"], fieldbackground=self.theme["panel"], font=(base_font, 10))
         style.configure("Panel.TFrame", background=self.theme["panel"])
         style.configure("Toolbar.TFrame", background=self.theme["panel_alt"])
 
@@ -1875,27 +2223,33 @@ class App(tk.Tk):
             "Header.TLabel",
             background=self.theme["panel"],
             foreground=self.theme["accent"],
-            font=("Segoe UI", 14, "bold"),
+            font=(base_font, 14, "bold"),
+        )
+        style.configure(
+            "CostTitle.TLabel",
+            background=self.theme["panel"],
+            foreground=self.theme["fg"],
+            font=(base_font, 14, "bold"),
         )
         style.configure(
             "Muted.TLabel",
             background=self.theme["panel"],
             foreground=self.theme["muted"],
-            font=("Segoe UI", 9, "italic"),
+            font=(base_font, 9, "italic"),
         )
 
-        style.configure("Toolbar.TButton", padding=(12, 6), font=("Segoe UI", 10, "bold"))
+        style.configure("Toolbar.TButton", padding=(12, 6), font=(base_font, 10, "bold"))
         style.map(
             "Toolbar.TButton",
             background=[("active", self.theme["accent"]), ("pressed", self.theme["border"])],
-            foreground=[("active", self.theme["bg"])],
+            foreground=[("active", self.theme["fg"])],
         )
 
-        style.configure("TButton", padding=(10, 5), font=("Segoe UI", 10))
+        style.configure("TButton", padding=(10, 5), font=(base_font, 10))
         style.map(
             "TButton",
             background=[("active", self.theme["accent"]), ("pressed", self.theme["border"])],
-            foreground=[("active", self.theme["bg"])]
+            foreground=[("active", self.theme["fg"])]
         )
 
         style.configure(
@@ -1904,7 +2258,7 @@ class App(tk.Tk):
             foreground=self.theme["entry_fg"],
             bordercolor=self.theme["border"],
             padding=4,
-            font=("Segoe UI", 10),
+            font=(base_font, 10),
         )
 
         style.configure(
@@ -1914,13 +2268,13 @@ class App(tk.Tk):
             background=self.theme["panel"],
             arrowcolor=self.theme["fg"],
             bordercolor=self.theme["border"],
-            font=("Segoe UI", 10)
+            font=(base_font, 10)
         )
         style.map(
             "Nature.TCombobox",
             fieldbackground=[("readonly", self.theme["entry_bg"])],
             selectbackground=[("readonly", self.theme["accent"])],
-            selectforeground=[("readonly", self.theme["bg"])],
+            selectforeground=[("readonly", self.theme["fg"])],
         )
 
         style.configure(
@@ -1930,12 +2284,12 @@ class App(tk.Tk):
             foreground=self.theme["fg"],
             bordercolor=self.theme["border"],
             rowheight=28,
-            font=("Segoe UI", 9),
+            font=(base_font, 9),
         )
         style.map(
             "Info.Treeview",
             background=[("selected", self.theme["accent"])],
-            foreground=[("selected", self.theme["bg"])],
+            foreground=[("selected", self.theme["fg"])],
         )
 
         style.configure(
@@ -1943,7 +2297,7 @@ class App(tk.Tk):
             background=self.theme["info_table_header_bg"],
             foreground=self.theme["fg"],
             relief="flat",
-            font=("Segoe UI", 10, "bold"),
+            font=(base_font, 10, "bold"),
         )
 
     def _on_theme_palette_selected(self, _event=None):
@@ -1962,20 +2316,51 @@ class App(tk.Tk):
         self.theme_manager.save(self.theme_cfg)
         self._apply_theme(refresh_canvas=True)
 
+    def _on_language_selected(self, _event=None):
+        lang = self.language_var.get().strip().lower()
+        if lang not in I18nManager.SUPPORTED:
+            lang = "en"
+        if lang == self._lang:
+            return
+        self._lang = lang
+        self.ui_cfg.language = lang
+        self.i18n.save_ui_config(self.ui_cfg)
+        self._ui_font_family = self._resolve_ui_font_family(lang)
+        self._apply_language()
+
     def _apply_theme(self, refresh_canvas: bool = True):
-        self.configure(bg=self.theme["bg"])
+        if self._use_ctk:
+            ctk.set_appearance_mode("Dark" if self.theme_cfg.mode == "dark" else "Light")
+            self.configure(fg_color=self.theme["bg"])
+        else:
+            self.configure(bg=self.theme["bg"])
         self._setup_style()
 
         if hasattr(self, "root_container"):
-            self.root_container.configure(style="Panel.TFrame")
+            try:
+                self.root_container.configure(fg_color=self.theme["panel"])
+            except Exception:
+                self.root_container.configure(style="Panel.TFrame")
         if hasattr(self, "toolbar"):
-            self.toolbar.configure(style="Toolbar.TFrame")
+            try:
+                self.toolbar.configure(fg_color=self.theme["panel_alt"])
+            except Exception:
+                self.toolbar.configure(style="Toolbar.TFrame")
         if hasattr(self, "left"):
-            self.left.configure(style="Panel.TFrame")
+            try:
+                self.left.configure(fg_color=self.theme["panel"])
+            except Exception:
+                self.left.configure(style="Panel.TFrame")
         if hasattr(self, "center"):
-            self.center.configure(style="Panel.TFrame")
+            try:
+                self.center.configure(fg_color=self.theme["panel"])
+            except Exception:
+                self.center.configure(style="Panel.TFrame")
         if hasattr(self, "right"):
-            self.right.configure(style="Panel.TFrame")
+            try:
+                self.right.configure(fg_color=self.theme["panel"])
+            except Exception:
+                self.right.configure(style="Panel.TFrame")
 
         if hasattr(self, "listbox"):
             self.listbox.configure(
@@ -1987,87 +2372,358 @@ class App(tk.Tk):
             )
         if hasattr(self, "sprite_label"):
             self.sprite_label.configure(bg=self.theme["panel"])
+        if hasattr(self, "_sprite_slot"):
+            self._sprite_slot.configure(bg=self.theme["panel"])
         if hasattr(self, "type_dot"):
             self.type_dot.configure(bg=self.theme["panel"])
+        if hasattr(self, "_sprite_frame"):
+            try:
+                self._sprite_frame.configure(fg_color=self.theme["panel"])
+            except Exception:
+                try:
+                    self._sprite_frame.configure(style="Panel.TFrame")
+                except Exception:
+                    pass
+        if hasattr(self, "_sprite_name_row"):
+            try:
+                self._sprite_name_row.configure(fg_color=self.theme["panel"])
+            except Exception:
+                try:
+                    self._sprite_name_row.configure(style="Panel.TFrame")
+                except Exception:
+                    pass
         if hasattr(self, "nature_combo"):
-            self.nature_combo.configure(style="Nature.TCombobox")
+            try:
+                self.nature_combo.configure(style="Nature.TCombobox")
+            except Exception:
+                self.nature_combo.configure(
+                    fg_color=self.theme["entry_bg"],
+                    text_color=self.theme["fg"],
+                    button_color=self.theme["panel_alt"],
+                    dropdown_fg_color=self.theme["panel"],
+                    dropdown_text_color=self.theme["fg"],
+                )
         if hasattr(self, "canvas"):
             self.canvas.configure(bg=self.theme["canvas_bg"], highlightbackground=self.theme["border"])
         if hasattr(self, "gender_box"):
-            self.gender_box.configure(
-                bg=self.theme["text_box_bg"],
-                fg=self.theme["text_box_fg"],
-                insertbackground=self.theme["fg"],
-                highlightbackground=self.theme["border"],
-            )
+            try:
+                self.gender_box.configure(
+                    bg=self.theme["text_box_bg"],
+                    fg=self.theme["text_box_fg"],
+                    insertbackground=self.theme["fg"],
+                    highlightbackground=self.theme["border"],
+                )
+            except Exception:
+                self.gender_box.configure(
+                    fg_color=self.theme["text_box_bg"],
+                    text_color=self.theme["text_box_fg"],
+                    border_color=self.theme["border"],
+                )
         if hasattr(self, "notes_box"):
-            self.notes_box.configure(
-                bg=self.theme["text_box_bg"],
-                fg=self.theme["text_box_fg"],
-                insertbackground=self.theme["fg"],
-                highlightbackground=self.theme["border"],
-            )
+            try:
+                self.notes_box.configure(
+                    bg=self.theme["text_box_bg"],
+                    fg=self.theme["text_box_fg"],
+                    insertbackground=self.theme["fg"],
+                    highlightbackground=self.theme["border"],
+                )
+            except Exception:
+                self.notes_box.configure(
+                    fg_color=self.theme["text_box_bg"],
+                    text_color=self.theme["text_box_fg"],
+                    border_color=self.theme["border"],
+                )
+        if hasattr(self, "cost_details"):
+            try:
+                self.cost_details.configure(text_color=self.theme["fg"])
+            except Exception:
+                try:
+                    self.cost_details.configure(foreground=self.theme["fg"])
+                except Exception:
+                    pass
         if hasattr(self, "theme_mode_btn"):
-            self.theme_mode_btn.configure(
-                text=f"Modo: {'Dark' if self.theme_cfg.mode == 'dark' else 'Light'}"
-            )
+            self.theme_mode_btn.configure(text=self.t("toolbar.mode", mode=("Dark" if self.theme_cfg.mode == "dark" else "Light")))
+        if self._use_ctk:
+            ctk_widgets = [
+                "toggle_left_btn",
+                "toggle_right_btn",
+                "inventory_btn",
+                "theme_mode_btn",
+                "info_btn",
+                "compatible_cb",
+            ]
+            for wn in ctk_widgets:
+                w = getattr(self, wn, None)
+                if w is None:
+                    continue
+                try:
+                    w.configure(
+                        fg_color=self.theme["panel_alt"],
+                        hover_color=self.theme["accent"],
+                        text_color=self.theme["fg"],
+                    )
+                except Exception:
+                    pass
+            for wn in ("language_combo", "theme_palette_combo", "nature_combo"):
+                w = getattr(self, wn, None)
+                if w is None:
+                    continue
+                try:
+                    w.configure(
+                        fg_color=self.theme["entry_bg"],
+                        text_color=self.theme["fg"],
+                        button_color=self.theme["panel_alt"],
+                        button_hover_color=self.theme["accent"],
+                        dropdown_fg_color=self.theme["panel"],
+                        dropdown_text_color=self.theme["fg"],
+                    )
+                except Exception:
+                    pass
+            for wn in (
+                "_left_header_label",
+                "_center_header_label",
+                "_right_header_label",
+                "_right_gender_header_label",
+                "_right_notes_header_label",
+                "name_label",
+            ):
+                w = getattr(self, wn, None)
+                if w is None:
+                    continue
+                try:
+                    w.configure(text_color=self.theme["accent"])
+                except Exception:
+                    pass
+            for wn in ("lang_label", "theme_label", "egg_groups_label", "status_label"):
+                w = getattr(self, wn, None)
+                if w is None:
+                    continue
+                try:
+                    w.configure(text_color=self.theme["muted"])
+                except Exception:
+                    pass
 
         self._refresh_iv_toggle_styles()
         if self._info_window and self._info_window.winfo_exists():
             self._apply_info_window_theme()
+        if self._inventory_window and self._inventory_window.winfo_exists():
+            try:
+                self._inventory_window.configure(bg=self.theme["panel"])
+            except Exception:
+                pass
+            if self._inventory_canvas is not None:
+                try:
+                    self._inventory_canvas.configure(
+                        bg=self.theme["entry_bg"],
+                        highlightbackground=self.theme["border"],
+                    )
+                except Exception:
+                    pass
+            notes_widget = self._inventory_form_vars.get("notes_widget") if self._inventory_form_vars else None
+            if notes_widget is not None:
+                try:
+                    notes_widget.configure(
+                        bg=self.theme["entry_bg"],
+                        fg=self.theme["fg"],
+                        insertbackground=self.theme["fg"],
+                        highlightbackground=self.theme["border"],
+                    )
+                except Exception:
+                    pass
+            if hasattr(self, "_inventory_detail_sprite_label"):
+                try:
+                    self._inventory_detail_sprite_label.configure(bg=self.theme["panel"])
+                except Exception:
+                    pass
+            self._inventory_draw_box()
 
         if refresh_canvas:
             if self.selected:
-                self._recompute()
+                # Recompose current sprite against new panel color immediately.
+                self._load_sprite_async(self.selected.id, self._selection_generation_id)
+                self._request_recompute(reason="theme")
             else:
                 self._render_empty()
 
+    def _apply_language(self):
+        self.title(self.t("app.title", version=APP_VERSION))
+        self.language_var.set(self._lang.upper())
+        self._setup_style()
+        if hasattr(self, "toggle_left_btn"):
+            self.toggle_left_btn.configure(text=(self.t("toolbar.hide_selection") if self._left_visible else self.t("toolbar.show_selection")))
+        if hasattr(self, "toggle_right_btn"):
+            self.toggle_right_btn.configure(text=(self.t("toolbar.hide_costs") if self._right_visible else self.t("toolbar.show_costs")))
+        if hasattr(self, "inventory_btn"):
+            self.inventory_btn.configure(text=self.t("toolbar.inventory"))
+        if hasattr(self, "theme_mode_btn"):
+            self.theme_mode_btn.configure(text=self.t("toolbar.mode", mode=("Dark" if self.theme_cfg.mode == "dark" else "Light")))
+        if hasattr(self, "lang_label"):
+            self.lang_label.configure(text=self.t("toolbar.language"))
+        if hasattr(self, "theme_label"):
+            self.theme_label.configure(text=self.t("toolbar.theme"))
+        if hasattr(self, "_left_header_label"):
+            self._left_header_label.configure(text=self.t("left.selection"))
+        if hasattr(self, "_pokemon_label"):
+            self._pokemon_label.configure(text=self.t("left.pokemon"))
+        if hasattr(self, "_ivs_header_label"):
+            self._ivs_header_label.configure(text=self.t("left.ivs"))
+        if hasattr(self, "_nature_header_label"):
+            self._nature_header_label.configure(text=self.t("left.nature"))
+        if hasattr(self, "info_btn"):
+            self.info_btn.configure(text=self.t("left.info"))
+        if hasattr(self, "compatible_cb"):
+            self.compatible_cb.configure(text=self.t("left.compatible"))
+        if hasattr(self, "_center_header_label"):
+            self._center_header_label.configure(text=self.t("center.layers"))
+        if hasattr(self, "_right_header_label"):
+            self._right_header_label.configure(text=self.t("right.costs"))
+        if hasattr(self, "_right_gender_header_label"):
+            self._right_gender_header_label.configure(text=self.t("right.gender_plan"))
+        if hasattr(self, "_right_notes_header_label"):
+            self._right_notes_header_label.configure(text=self.t("right.notes"))
+        for btn in self._iv_buttons.values():
+            try:
+                btn.configure(font=(self._ui_font_family, 9, "bold"))
+            except Exception:
+                pass
+        if not self.selected:
+            self._egg_groups_var.set(self.t("left.egg_groups", groups="—"))
+        if hasattr(self, "status_label"):
+            self.status_label.configure(font=(self._ui_font_family, 9))
+        if self._info_window and self._info_window.winfo_exists():
+            self._build_info_window_texts()
+            self._apply_info_window_theme()
+            if self._info_species_id:
+                self._set_info_loading(self.t("info.loading"))
+                self._load_info_async(self._info_species_id)
+        if self._inventory_window and self._inventory_window.winfo_exists():
+            self._inventory_window.destroy()
+            self._inventory_window = None
+            self._open_inventory_window()
+        if self.selected:
+            self._request_recompute(reason="language")
+        else:
+            self._set_status("status.ready", is_key=True, version=APP_VERSION)
+
     # ---------- Layout ----------
     def _build_layout(self):
-        root = ttk.Frame(self, style="Panel.TFrame")
+        if self._use_ctk:
+            root = ctk.CTkFrame(self, fg_color=self.theme["panel"], corner_radius=10)
+        else:
+            root = ttk.Frame(self, style="Panel.TFrame")
         root.pack(fill="both", expand=True, padx=12, pady=12)
         root.columnconfigure(0, weight=1)
         root.rowconfigure(1, weight=1)
         self.root_container = root
 
-        self.toolbar = ttk.Frame(root, style="Toolbar.TFrame")
+        if self._use_ctk:
+            self.toolbar = ctk.CTkFrame(root, fg_color=self.theme["panel_alt"], corner_radius=8)
+        else:
+            self.toolbar = ttk.Frame(root, style="Toolbar.TFrame")
         self.toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         self.toolbar.columnconfigure(0, weight=0)
         self.toolbar.columnconfigure(1, weight=0)
-        self.toolbar.columnconfigure(2, weight=1)
-        self.toolbar.columnconfigure(3, weight=0)
+        self.toolbar.columnconfigure(2, weight=0)
+        self.toolbar.columnconfigure(3, weight=1)
         self.toolbar.columnconfigure(4, weight=0)
         self.toolbar.columnconfigure(5, weight=0)
+        self.toolbar.columnconfigure(6, weight=0)
+        self.toolbar.columnconfigure(7, weight=0)
+        self.toolbar.columnconfigure(8, weight=0)
 
-        self.toggle_left_btn = ttk.Button(
-            self.toolbar, text="Ocultar Selección", style="Toolbar.TButton", command=self._toggle_left_panel
-        )
+        if self._use_ctk:
+            self.toggle_left_btn = ctk.CTkButton(self.toolbar, text=self.t("toolbar.hide_selection"), command=self._toggle_left_panel, width=130)
+        else:
+            self.toggle_left_btn = ttk.Button(
+                self.toolbar, text=self.t("toolbar.hide_selection"), style="Toolbar.TButton", command=self._toggle_left_panel
+            )
         self.toggle_left_btn.grid(row=0, column=0, padx=(8, 6), pady=8, sticky="w")
-        self.toggle_right_btn = ttk.Button(
-            self.toolbar, text="Ocultar Costos", style="Toolbar.TButton", command=self._toggle_right_panel
-        )
+        if self._use_ctk:
+            self.toggle_right_btn = ctk.CTkButton(self.toolbar, text=self.t("toolbar.hide_costs"), command=self._toggle_right_panel, width=120)
+        else:
+            self.toggle_right_btn = ttk.Button(
+                self.toolbar, text=self.t("toolbar.hide_costs"), style="Toolbar.TButton", command=self._toggle_right_panel
+            )
         self.toggle_right_btn.grid(row=0, column=1, padx=(0, 8), pady=8, sticky="w")
+        if self._use_ctk:
+            self.inventory_btn = ctk.CTkButton(self.toolbar, text=self.t("toolbar.inventory"), command=self._open_inventory_window, width=120)
+        else:
+            self.inventory_btn = ttk.Button(
+                self.toolbar, text=self.t("toolbar.inventory"), style="Toolbar.TButton", command=self._open_inventory_window
+            )
+        self.inventory_btn.grid(row=0, column=2, padx=(0, 8), pady=8, sticky="w")
 
-        ttk.Label(self.toolbar, text="Tema", style="Muted.TLabel").grid(row=0, column=3, padx=(0, 6), sticky="e")
-        self.theme_palette_combo = ttk.Combobox(
-            self.toolbar,
-            textvariable=self.theme_palette_var,
-            values=list(PALETTES.keys()),
-            state="readonly",
-            width=16,
-            style="Nature.TCombobox",
-        )
-        self.theme_palette_combo.grid(row=0, column=4, padx=(0, 6), pady=8, sticky="e")
-        self.theme_palette_combo.bind("<<ComboboxSelected>>", self._on_theme_palette_selected)
-        self.theme_mode_btn = ttk.Button(
-            self.toolbar,
-            text=f"Modo: {'Dark' if self.theme_cfg.mode == 'dark' else 'Light'}",
-            style="Toolbar.TButton",
-            command=self._toggle_theme_mode,
-        )
-        self.theme_mode_btn.grid(row=0, column=5, padx=(0, 8), pady=8, sticky="e")
+        if self._use_ctk:
+            self.lang_label = ctk.CTkLabel(self.toolbar, text=self.t("toolbar.language"))
+        else:
+            self.lang_label = ttk.Label(self.toolbar, text=self.t("toolbar.language"), style="Muted.TLabel")
+        self.lang_label.grid(row=0, column=3, padx=(0, 6), sticky="e")
+        if self._use_ctk:
+            self.language_combo = ctk.CTkComboBox(
+                self.toolbar,
+                variable=self.language_var,
+                values=["ES", "EN", "ZH"],
+                width=70,
+                command=lambda _v: self._on_language_selected(),
+            )
+        else:
+            self.language_combo = ttk.Combobox(
+                self.toolbar,
+                textvariable=self.language_var,
+                values=["ES", "EN", "ZH"],
+                state="readonly",
+                width=6,
+                style="Nature.TCombobox",
+            )
+        self.language_combo.grid(row=0, column=4, padx=(0, 10), pady=8, sticky="e")
+        if not self._use_ctk:
+            self.language_combo.bind("<<ComboboxSelected>>", self._on_language_selected)
 
-        main = ttk.Frame(root, style="Panel.TFrame")
+        if self._use_ctk:
+            self.theme_label = ctk.CTkLabel(self.toolbar, text=self.t("toolbar.theme"))
+        else:
+            self.theme_label = ttk.Label(self.toolbar, text=self.t("toolbar.theme"), style="Muted.TLabel")
+        self.theme_label.grid(row=0, column=5, padx=(0, 6), sticky="e")
+        if self._use_ctk:
+            self.theme_palette_combo = ctk.CTkComboBox(
+                self.toolbar,
+                variable=self.theme_palette_var,
+                values=list(PALETTES.keys()),
+                width=170,
+                command=lambda _v: self._on_theme_palette_selected(),
+            )
+        else:
+            self.theme_palette_combo = ttk.Combobox(
+                self.toolbar,
+                textvariable=self.theme_palette_var,
+                values=list(PALETTES.keys()),
+                state="readonly",
+                width=16,
+                style="Nature.TCombobox",
+            )
+        self.theme_palette_combo.grid(row=0, column=6, padx=(0, 6), pady=8, sticky="e")
+        if not self._use_ctk:
+            self.theme_palette_combo.bind("<<ComboboxSelected>>", self._on_theme_palette_selected)
+        if self._use_ctk:
+            self.theme_mode_btn = ctk.CTkButton(
+                self.toolbar,
+                text=self.t("toolbar.mode", mode=("Dark" if self.theme_cfg.mode == "dark" else "Light")),
+                command=self._toggle_theme_mode,
+                width=120,
+            )
+        else:
+            self.theme_mode_btn = ttk.Button(
+                self.toolbar,
+                text=self.t("toolbar.mode", mode=("Dark" if self.theme_cfg.mode == "dark" else "Light")),
+                style="Toolbar.TButton",
+                command=self._toggle_theme_mode,
+            )
+        self.theme_mode_btn.grid(row=0, column=7, padx=(0, 8), pady=8, sticky="e")
+
+        if self._use_ctk:
+            main = ctk.CTkFrame(root, fg_color=self.theme["panel"], corner_radius=0)
+        else:
+            main = ttk.Frame(root, style="Panel.TFrame")
         main.grid(row=1, column=0, sticky="nsew")
         main.columnconfigure(0, weight=3)
         main.columnconfigure(1, weight=4)
@@ -2075,9 +2731,14 @@ class App(tk.Tk):
         main.rowconfigure(0, weight=1)
         self.main_grid = main
 
-        self.left = ttk.Frame(main, style="Panel.TFrame")
-        self.center = ttk.Frame(main, style="Panel.TFrame")
-        self.right = ttk.Frame(main, style="Panel.TFrame")
+        if self._use_ctk:
+            self.left = ctk.CTkFrame(main, fg_color=self.theme["panel"], corner_radius=8)
+            self.center = ctk.CTkFrame(main, fg_color=self.theme["panel"], corner_radius=8)
+            self.right = ctk.CTkFrame(main, fg_color=self.theme["panel"], corner_radius=8)
+        else:
+            self.left = ttk.Frame(main, style="Panel.TFrame")
+            self.center = ttk.Frame(main, style="Panel.TFrame")
+            self.right = ttk.Frame(main, style="Panel.TFrame")
         self.left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
         self.center.grid(row=0, column=1, sticky="nsew", padx=(0, 10))
         self.right.grid(row=0, column=2, sticky="nsew")
@@ -2085,6 +2746,12 @@ class App(tk.Tk):
         self._build_left()
         self._build_center()
         self._build_right()
+
+        if self._use_ctk:
+            self.status_label = ctk.CTkLabel(root, textvariable=self._status_var, anchor="w")
+        else:
+            self.status_label = ttk.Label(root, textvariable=self._status_var, style="Muted.TLabel")
+        self.status_label.grid(row=2, column=0, sticky="ew", pady=(6, 0), padx=(2, 2))
         self._update_panel_layout()
 
     def _toggle_left_panel(self):
@@ -2111,27 +2778,41 @@ class App(tk.Tk):
         self.main_grid.columnconfigure(0, weight=left_w)
         self.main_grid.columnconfigure(1, weight=center_w)
         self.main_grid.columnconfigure(2, weight=right_w)
-        self.toggle_left_btn.configure(text=("Ocultar Selección" if self._left_visible else "Mostrar Selección"))
-        self.toggle_right_btn.configure(text=("Ocultar Costos" if self._right_visible else "Mostrar Costos"))
+        self.toggle_left_btn.configure(text=(self.t("toolbar.hide_selection") if self._left_visible else self.t("toolbar.show_selection")))
+        self.toggle_right_btn.configure(text=(self.t("toolbar.hide_costs") if self._right_visible else self.t("toolbar.show_costs")))
 
     # ---------- Left panel ----------
     def _build_left(self):
         p = self.left
         p.columnconfigure(0, weight=1)
-        ttk.Label(p, text="Selección", style="Header.TLabel").grid(row=0, column=0, sticky="w", padx=12, pady=(12, 6))
+        if self._use_ctk:
+            self._left_header_label = ctk.CTkLabel(p, text=self.t("left.selection"), anchor="w", font=(self._ui_font_family, 22, "bold"), text_color=self.theme["accent"])
+        else:
+            self._left_header_label = ttk.Label(p, text=self.t("left.selection"), style="Header.TLabel")
+        self._left_header_label.grid(row=0, column=0, sticky="w", padx=12, pady=(12, 6))
 
         # Search entry with Enter binding
         self.search_var.trace_add("write", lambda *_: self._apply_filter())
-        entry = ttk.Entry(p, textvariable=self.search_var)
+        if self._use_ctk:
+            entry = ctk.CTkEntry(p, textvariable=self.search_var)
+        else:
+            entry = ttk.Entry(p, textvariable=self.search_var)
         entry.grid(row=1, column=0, sticky="ew", padx=12)
         # Bind Enter key to auto select the first result
         entry.bind("<Return>", lambda e: self._select_first_result())
         entry.bind("<KP_Enter>", lambda e: self._select_first_result())
 
-        ttk.Label(p, text="Pokémon", style="Muted.TLabel").grid(row=2, column=0, sticky="w", padx=12, pady=(10, 2))
+        if self._use_ctk:
+            self._pokemon_label = ctk.CTkLabel(p, text=self.t("left.pokemon"), anchor="w")
+        else:
+            self._pokemon_label = ttk.Label(p, text=self.t("left.pokemon"), style="Muted.TLabel")
+        self._pokemon_label.grid(row=2, column=0, sticky="w", padx=12, pady=(10, 2))
 
         # Listbox inside a frame with scrollbar
-        lb_frame = ttk.Frame(p, style="Panel.TFrame")
+        if self._use_ctk:
+            lb_frame = ctk.CTkFrame(p, fg_color=self.theme["panel"], corner_radius=8)
+        else:
+            lb_frame = ttk.Frame(p, style="Panel.TFrame")
         lb_frame.grid(row=3, column=0, sticky="nsew", padx=12, pady=(0, 10))
         lb_frame.columnconfigure(0, weight=1)
         lb_frame.rowconfigure(0, weight=1)
@@ -2148,53 +2829,115 @@ class App(tk.Tk):
         self.listbox.config(yscrollcommand=sb.set)
 
         # Sprite frame
-        sprite_frame = ttk.Frame(p, style="Panel.TFrame")
+        if self._use_ctk:
+            sprite_frame = ctk.CTkFrame(p, fg_color=self.theme["panel"], corner_radius=8)
+        else:
+            sprite_frame = ttk.Frame(p, style="Panel.TFrame")
         sprite_frame.grid(row=4, column=0, sticky="ew", padx=12, pady=(0, 10))
+        self._sprite_frame = sprite_frame
         sprite_frame.columnconfigure(1, weight=1)
-        self.sprite_label = tk.Label(sprite_frame, bg=self.theme["panel"])
-        self.sprite_label.grid(row=0, column=0, rowspan=2, padx=(0, 10), pady=6)
-        name_row = ttk.Frame(sprite_frame, style="Panel.TFrame")
+        sprite_slot = tk.Frame(sprite_frame, bg=self.theme["panel"], width=108, height=108, highlightthickness=0, bd=0)
+        sprite_slot.grid(row=0, column=0, rowspan=2, padx=(0, 10), pady=6, sticky="nw")
+        sprite_slot.grid_propagate(False)
+        self._sprite_slot = sprite_slot
+        self.sprite_label = tk.Label(sprite_slot, bg=self.theme["panel"], bd=0, highlightthickness=0)
+        self.sprite_label.place(relx=0.5, rely=0.5, anchor="center")
+        if self._use_ctk:
+            name_row = ctk.CTkFrame(sprite_frame, fg_color=self.theme["panel"], corner_radius=0)
+        else:
+            name_row = ttk.Frame(sprite_frame, style="Panel.TFrame")
         name_row.grid(row=0, column=1, sticky="w")
+        self._sprite_name_row = name_row
+        name_row.columnconfigure(1, weight=1)
         self.type_dot = tk.Canvas(name_row, width=10, height=10, bg=self.theme["panel"], highlightthickness=0)
         self.type_dot.grid(row=0, column=0, padx=(0, 6))
         self.type_dot_id = self.type_dot.create_oval(1, 1, 9, 9, fill="#444", outline="#444")
-        self.name_label = ttk.Label(name_row, textvariable=self._name_type_text_var, style="Header.TLabel")
+        if self._use_ctk:
+            self.name_label = ctk.CTkLabel(
+                name_row,
+                textvariable=self._name_type_text_var,
+                anchor="w",
+                font=(self._ui_font_family, 20, "bold"),
+                text_color=self.theme["accent"],
+                width=360,
+            )
+        else:
+            self.name_label = ttk.Label(name_row, textvariable=self._name_type_text_var, style="Header.TLabel")
         self.name_label.grid(row=0, column=1, sticky="w")
-        self.info_btn = ttk.Button(sprite_frame, text="Info", command=self._open_pokemon_info_window)
+        if self._use_ctk:
+            self.info_btn = ctk.CTkButton(sprite_frame, text=self.t("left.info"), command=self._open_pokemon_info_window, width=80)
+        else:
+            self.info_btn = ttk.Button(sprite_frame, text=self.t("left.info"), command=self._open_pokemon_info_window)
         self.info_btn.grid(row=0, column=2, sticky="e", padx=(8, 0))
-        self.egg_groups_label = ttk.Label(sprite_frame, textvariable=self._egg_groups_var, style="Muted.TLabel")
+        if self._use_ctk:
+            self.egg_groups_label = ctk.CTkLabel(sprite_frame, textvariable=self._egg_groups_var, anchor="w")
+        else:
+            self.egg_groups_label = ttk.Label(sprite_frame, textvariable=self._egg_groups_var, style="Muted.TLabel")
         self.egg_groups_label.grid(row=1, column=1, columnspan=2, sticky="w")
 
         # IV toggles
-        ttk.Label(p, text="IVs deseados (31)", style="Header.TLabel").grid(row=5, column=0, sticky="w", padx=12, pady=(8, 6))
-        iv_grid = ttk.Frame(p, style="Panel.TFrame")
+        if self._use_ctk:
+            self._ivs_header_label = ctk.CTkLabel(p, text=self.t("left.ivs"), anchor="w", font=(self._ui_font_family, 22, "bold"), text_color=self.theme["accent"])
+        else:
+            self._ivs_header_label = ttk.Label(p, text=self.t("left.ivs"), style="Header.TLabel")
+        self._ivs_header_label.grid(row=5, column=0, sticky="w", padx=12, pady=(8, 6))
+        if self._use_ctk:
+            iv_grid = ctk.CTkFrame(p, fg_color=self.theme["panel"], corner_radius=0)
+        else:
+            iv_grid = ttk.Frame(p, style="Panel.TFrame")
         iv_grid.grid(row=6, column=0, sticky="ew", padx=12)
         self._build_iv_toggles(iv_grid)
 
-        ttk.Label(p, text="Naturaleza deseada", style="Header.TLabel").grid(row=7, column=0, sticky="w", padx=12, pady=(10, 4))
-        self.nature_combo = ttk.Combobox(
-            p, textvariable=self.nature_var, values=NATURE_OPTIONS, state="readonly", style="Nature.TCombobox"
-        )
+        if self._use_ctk:
+            self._nature_header_label = ctk.CTkLabel(p, text=self.t("left.nature"), anchor="w", font=(self._ui_font_family, 22, "bold"), text_color=self.theme["accent"])
+        else:
+            self._nature_header_label = ttk.Label(p, text=self.t("left.nature"), style="Header.TLabel")
+        self._nature_header_label.grid(row=7, column=0, sticky="w", padx=12, pady=(10, 4))
+        if self._use_ctk:
+            self.nature_combo = ctk.CTkComboBox(
+                p,
+                variable=self.nature_var,
+                values=NATURE_OPTIONS,
+                command=lambda _v: self._request_recompute(reason="nature"),
+            )
+        else:
+            self.nature_combo = ttk.Combobox(
+                p, textvariable=self.nature_var, values=NATURE_OPTIONS, state="readonly", style="Nature.TCombobox"
+            )
         self.nature_combo.grid(row=8, column=0, sticky="ew", padx=12, pady=(0, 10))
-        self.nature_combo.bind("<<ComboboxSelected>>", lambda e: self._recompute())
-        comp_cb = ttk.Checkbutton(p, text="Compatibles / Ditto", variable=self.compatible_var, command=self._recompute)
-        comp_cb.grid(row=9, column=0, sticky="w", padx=12, pady=(0, 10))
+        if not self._use_ctk:
+            self.nature_combo.bind("<<ComboboxSelected>>", lambda e: self._request_recompute(reason="nature"))
+        if self._use_ctk:
+            self.compatible_cb = ctk.CTkCheckBox(p, text=self.t("left.compatible"), variable=self.compatible_var, command=lambda: self._request_recompute(reason="compatible"))
+        else:
+            self.compatible_cb = ttk.Checkbutton(p, text=self.t("left.compatible"), variable=self.compatible_var, command=lambda: self._request_recompute(reason="compatible"))
+        self.compatible_cb.grid(row=9, column=0, sticky="w", padx=12, pady=(0, 10))
 
         p.rowconfigure(3, weight=1)
 
     def _build_iv_toggles(self, parent: ttk.Frame):
         for i, stat in enumerate(STATS):
-            btn = tk.Button(
-                parent,
-                text=stat,
-                relief="flat",
-                bd=0,
-                padx=10,
-                pady=6,
-                cursor="hand2",
-                command=lambda s=stat: self._on_iv_toggle(s),
-                font=("Segoe UI", 9, "bold"),
-            )
+            if self._use_ctk:
+                btn = ctk.CTkButton(
+                    parent,
+                    text=stat,
+                    command=lambda s=stat: self._on_iv_toggle(s),
+                    corner_radius=8,
+                    height=30,
+                    font=(self._ui_font_family, 12, "bold"),
+                )
+            else:
+                btn = tk.Button(
+                    parent,
+                    text=stat,
+                    relief="flat",
+                    bd=0,
+                    padx=10,
+                    pady=6,
+                    cursor="hand2",
+                    command=lambda s=stat: self._on_iv_toggle(s),
+                    font=(self._ui_font_family, 9, "bold"),
+                )
             btn.grid(row=i // 3, column=i % 3, sticky="ew", padx=4, pady=4)
             parent.columnconfigure(i % 3, weight=1)
             self._iv_buttons[stat] = btn
@@ -2214,15 +2957,24 @@ class App(tk.Tk):
             fg = self.theme["iv_off_fg"]
             active_bg = self.theme["panel_alt"]
             active_fg = self.theme["fg"]
-        btn.configure(
-            bg=bg,
-            fg=fg,
-            activebackground=active_bg,
-            activeforeground=active_fg,
-            highlightthickness=1,
-            highlightbackground=self.theme["border"],
-            highlightcolor=self.theme["accent"],
-        )
+        if self._use_ctk:
+            btn.configure(
+                fg_color=bg,
+                text_color=fg,
+                hover_color=active_bg,
+                border_color=self.theme["border"],
+                border_width=1,
+            )
+        else:
+            btn.configure(
+                bg=bg,
+                fg=fg,
+                activebackground=active_bg,
+                activeforeground=active_fg,
+                highlightthickness=1,
+                highlightbackground=self.theme["border"],
+                highlightcolor=self.theme["accent"],
+            )
 
     def _refresh_iv_toggle_styles(self):
         for stat in STATS:
@@ -2232,14 +2984,15 @@ class App(tk.Tk):
         var = self.iv_vars[stat]
         var.set(not var.get())
         self._set_iv_toggle_visual(stat, var.get())
-        self._recompute()
+        self._request_recompute(reason=f"iv:{stat}")
 
     # ---------- Center panel ----------
     def _build_center(self):
         p = self.center
         p.columnconfigure(0, weight=1)
         p.rowconfigure(1, weight=1)
-        ttk.Label(p, text="Capas (nodos)", style="Header.TLabel").grid(row=0, column=0, sticky="w", padx=12, pady=(12, 6))
+        self._center_header_label = ttk.Label(p, text=self.t("center.layers"), style="Header.TLabel")
+        self._center_header_label.grid(row=0, column=0, sticky="w", padx=12, pady=(12, 6))
         self.canvas = tk.Canvas(p, bg=self.theme["canvas_bg"], highlightthickness=1, highlightbackground=self.theme["border"])
         self.canvas.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
         self.canvas.bind("<Configure>", self._on_canvas_resize)
@@ -2256,26 +3009,50 @@ class App(tk.Tk):
         p = self.right
         p.columnconfigure(0, weight=1)
         p.rowconfigure(7, weight=1)
-        ttk.Label(p, text="Costos", style="Header.TLabel").grid(row=0, column=0, sticky="w", padx=12, pady=(12, 6))
-        self.cost_title = ttk.Label(p, text="—", style="Header.TLabel")
+        if self._use_ctk:
+            self._right_header_label = ctk.CTkLabel(p, text=self.t("right.costs"), anchor="w", font=(self._ui_font_family, 22, "bold"), text_color=self.theme["accent"])
+        else:
+            self._right_header_label = ttk.Label(p, text=self.t("right.costs"), style="Header.TLabel")
+        self._right_header_label.grid(row=0, column=0, sticky="w", padx=12, pady=(12, 6))
+        if self._use_ctk:
+            self.cost_title = ctk.CTkLabel(p, text="—", anchor="w", font=(self._ui_font_family, 20, "bold"), text_color=self.theme["fg"])
+        else:
+            self.cost_title = ttk.Label(p, text="—", style="CostTitle.TLabel")
         self.cost_title.grid(row=1, column=0, sticky="w", padx=12)
-        self.cost_details = ttk.Label(p, text="", style="Muted.TLabel", justify="left")
+        if self._use_ctk:
+            self.cost_details = ctk.CTkLabel(p, text="", justify="left", anchor="w", text_color=self.theme["fg"])
+        else:
+            self.cost_details = ttk.Label(p, text="", justify="left")
         self.cost_details.grid(row=2, column=0, sticky="w", padx=12, pady=(6, 10))
-        ttk.Label(p, text="Plan de género", style="Header.TLabel").grid(row=3, column=0, sticky="w", padx=12, pady=(8, 6))
-        self.gender_box = tk.Text(
-            p, height=10, wrap="word",
-            bg=self.theme["text_box_bg"], fg=self.theme["text_box_fg"],
-            insertbackground=self.theme["fg"],
-            highlightthickness=1, highlightbackground=self.theme["border"]
-        )
+        if self._use_ctk:
+            self._right_gender_header_label = ctk.CTkLabel(p, text=self.t("right.gender_plan"), anchor="w", font=(self._ui_font_family, 22, "bold"), text_color=self.theme["accent"])
+        else:
+            self._right_gender_header_label = ttk.Label(p, text=self.t("right.gender_plan"), style="Header.TLabel")
+        self._right_gender_header_label.grid(row=3, column=0, sticky="w", padx=12, pady=(8, 6))
+        if self._use_ctk:
+            self.gender_box = ctk.CTkTextbox(p, height=180)
+        else:
+            self.gender_box = tk.Text(
+                p, height=10, wrap="word",
+                bg=self.theme["text_box_bg"], fg=self.theme["text_box_fg"],
+                insertbackground=self.theme["fg"],
+                highlightthickness=1, highlightbackground=self.theme["border"]
+            )
         self.gender_box.grid(row=4, column=0, sticky="nsew", padx=12, pady=(0, 10))
-        ttk.Label(p, text="Notas", style="Header.TLabel").grid(row=6, column=0, sticky="w", padx=12, pady=(8, 6))
-        self.notes_box = tk.Text(
-            p, height=10, wrap="word",
-            bg=self.theme["text_box_bg"], fg=self.theme["text_box_fg"],
-            insertbackground=self.theme["fg"],
-            highlightthickness=1, highlightbackground=self.theme["border"]
-        )
+        if self._use_ctk:
+            self._right_notes_header_label = ctk.CTkLabel(p, text=self.t("right.notes"), anchor="w", font=(self._ui_font_family, 22, "bold"), text_color=self.theme["accent"])
+        else:
+            self._right_notes_header_label = ttk.Label(p, text=self.t("right.notes"), style="Header.TLabel")
+        self._right_notes_header_label.grid(row=6, column=0, sticky="w", padx=12, pady=(8, 6))
+        if self._use_ctk:
+            self.notes_box = ctk.CTkTextbox(p, height=220)
+        else:
+            self.notes_box = tk.Text(
+                p, height=10, wrap="word",
+                bg=self.theme["text_box_bg"], fg=self.theme["text_box_fg"],
+                insertbackground=self.theme["fg"],
+                highlightthickness=1, highlightbackground=self.theme["border"]
+            )
         self.notes_box.grid(row=7, column=0, sticky="nsew", padx=12, pady=(0, 12))
 
     # ---------- Data load ----------
@@ -2287,7 +3064,7 @@ class App(tk.Tk):
                 self.filtered = items[:]
                 self.after(0, self._refresh_list)
             except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Error", str(e)))
+                self.after(0, lambda: messagebox.showerror(self.t("dialog.error"), str(e)))
         threading.Thread(target=task, daemon=True).start()
 
     def _refresh_list(self):
@@ -2299,6 +3076,7 @@ class App(tk.Tk):
         else:
             self.selected = None
             self._name_type_text_var.set("—")
+            self._egg_groups_var.set(self.t("left.egg_groups", groups="—"))
             self._show_default_sprite()
             self._render_empty()
 
@@ -2330,14 +3108,669 @@ class App(tk.Tk):
             return
         entry = self.filtered[idx]
         self.selected = entry
+        self._selection_generation_id += 1
+        sel_gen = self._selection_generation_id
         self._name_type_text_var.set(f"{entry.name} (#{entry.id})")
-        self._egg_groups_var.set("Grupos Huevo: cargando...")
+        self._egg_groups_var.set(self.t("left.egg_groups_loading"))
         self.type_dot.itemconfig(self.type_dot_id, fill="#444", outline="#444")
-        self._load_sprite_async(entry.id)
-        self._load_species_meta_async(entry.id, entry.name)
-        self._recompute()
+        self._load_sprite_async(entry.id, sel_gen)
+        self._load_species_meta_async(entry.id, entry.name, sel_gen)
+        self._request_recompute(reason="select")
 
-    def _load_species_meta_async(self, pid: int, pname: str):
+    def _open_inventory_window(self):
+        return self._open_inventory_window_pc()
+
+    # ---------- Inventory PC Box ----------
+    def _open_inventory_window_pc(self):
+        if self._inventory_window and self._inventory_window.winfo_exists():
+            self._inventory_window.lift()
+            self._inventory_window.focus_set()
+            self._inventory_draw_box()
+            return
+
+        win = tk.Toplevel(self)
+        win.title(self.t("inventory.title"))
+        win.geometry("1240x760")
+        win.minsize(1080, 640)
+        win.configure(bg=self.theme["panel"])
+        win.protocol("WM_DELETE_WINDOW", lambda: setattr(self, "_inventory_window", None) or win.destroy())
+        self._inventory_window = win
+
+        root = ttk.Frame(win, style="Panel.TFrame")
+        root.pack(fill="both", expand=True, padx=10, pady=10)
+        root.columnconfigure(0, weight=5)
+        root.columnconfigure(1, weight=3)
+        root.rowconfigure(1, weight=1)
+
+        header = ttk.Frame(root, style="Panel.TFrame")
+        header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        ttk.Button(header, text="<", width=3, command=self._inventory_prev_box).pack(side="left")
+        ttk.Label(header, textvariable=self._inventory_box_label_var, style="Header.TLabel").pack(side="left", padx=(6, 10))
+        ttk.Button(header, text=">", width=3, command=self._inventory_next_box).pack(side="left", padx=(0, 10))
+        ttk.Button(header, text=self.t("inventory.btn.import"), command=self._inventory_import_pc).pack(side="left", padx=(0, 6))
+        ttk.Button(header, text=self.t("inventory.btn.export"), command=self._inventory_export_pc).pack(side="left")
+
+        left = ttk.Frame(root, style="Panel.TFrame")
+        left.grid(row=1, column=0, sticky="nsew", padx=(0, 10))
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(left, bg=self.theme["entry_bg"], highlightthickness=1, highlightbackground=self.theme["border"])
+        canvas.grid(row=0, column=0, sticky="nsew")
+        ysb = ttk.Scrollbar(left, orient="vertical", command=canvas.yview)
+        ysb.grid(row=0, column=1, sticky="ns")
+        xsb = ttk.Scrollbar(left, orient="horizontal", command=canvas.xview)
+        xsb.grid(row=1, column=0, sticky="ew")
+        canvas.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        canvas.bind("<ButtonPress-1>", self._inventory_on_canvas_press)
+        canvas.bind("<B1-Motion>", self._inventory_on_canvas_motion)
+        canvas.bind("<ButtonRelease-1>", self._inventory_on_canvas_release)
+        self._inventory_canvas = canvas
+
+        right = ttk.Frame(root, style="Panel.TFrame")
+        right.grid(row=1, column=1, sticky="nsew")
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(0, weight=1)
+
+        self._inventory_form_vars = {
+            "id": tk.StringVar(value=""),
+            "species": tk.StringVar(value=""),
+            "species_id_label": tk.StringVar(value="—"),
+            "gender": tk.StringVar(value="U"),
+            "nature": tk.StringVar(value=""),
+            "level": tk.StringVar(value=str(self.inventory_settings.default_level)),
+            "ball": tk.StringVar(value=""),
+            "price": tk.StringVar(value="0"),
+            "egg_groups": tk.StringVar(value="—"),
+        }
+        iv_vars: Dict[str, tk.IntVar] = {s: tk.IntVar(value=0) for s in STAT_KEYS}
+        self._inventory_form_vars["ivs"] = iv_vars
+
+        notebook = ttk.Notebook(right)
+        notebook.grid(row=0, column=0, sticky="nsew")
+        tab_data = ttk.Frame(notebook, style="Panel.TFrame")
+        tab_stats = ttk.Frame(notebook, style="Panel.TFrame")
+        tab_ivs = ttk.Frame(notebook, style="Panel.TFrame")
+        notebook.add(tab_data, text=self.t("inventory.tab.data"))
+        notebook.add(tab_stats, text=self.t("inventory.tab.stats"))
+        notebook.add(tab_ivs, text=self.t("inventory.tab.ivs"))
+
+        tab_data.columnconfigure(0, weight=1)
+        tab_data.rowconfigure(18, weight=1)
+
+        preview = tk.Frame(tab_data, bg=self.theme["panel"])
+        preview.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
+        preview.columnconfigure(1, weight=1)
+        self._inventory_detail_img = None
+        self._inventory_detail_sprite_label = tk.Label(preview, bg=self.theme["panel"], bd=0, highlightthickness=0)
+        self._inventory_detail_sprite_label.grid(row=0, column=0, rowspan=2, padx=(0, 10))
+        self._inventory_species_id_label = ttk.Label(preview, textvariable=self._inventory_form_vars["species_id_label"], style="Muted.TLabel")
+        self._inventory_species_id_label.grid(row=0, column=1, sticky="w")
+
+        ttk.Label(tab_data, text=self.t("inventory.col.species"), style="Muted.TLabel").grid(row=2, column=0, sticky="w", padx=8, pady=(0, 2))
+        species_combo = ttk.Combobox(tab_data, textvariable=self._inventory_form_vars["species"], values=[x.name for x in self.items], style="Nature.TCombobox")
+        species_combo.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 6))
+        species_combo.bind("<<ComboboxSelected>>", lambda _e: self._inventory_on_species_changed())
+
+        ttk.Label(tab_data, text=self.t("inventory.col.gender"), style="Muted.TLabel").grid(row=4, column=0, sticky="w", padx=8, pady=(0, 2))
+        gw = ttk.Frame(tab_data, style="Panel.TFrame")
+        gw.grid(row=5, column=0, sticky="w", padx=8, pady=(0, 6))
+        ttk.Radiobutton(gw, text="M", variable=self._inventory_form_vars["gender"], value="M").pack(side="left")
+        ttk.Radiobutton(gw, text="F", variable=self._inventory_form_vars["gender"], value="F").pack(side="left", padx=(8, 0))
+        ttk.Radiobutton(gw, text="U", variable=self._inventory_form_vars["gender"], value="U").pack(side="left", padx=(8, 0))
+
+        ttk.Label(tab_data, text=self.t("left.nature"), style="Muted.TLabel").grid(row=6, column=0, sticky="w", padx=8, pady=(0, 2))
+        ncombo = ttk.Combobox(tab_data, textvariable=self._inventory_form_vars["nature"], values=[""] + NATURE_OPTIONS, style="Nature.TCombobox")
+        ncombo.grid(row=7, column=0, sticky="ew", padx=8, pady=(0, 6))
+        ncombo.bind("<<ComboboxSelected>>", lambda _e: self._inventory_refresh_stats())
+
+        ttk.Label(tab_data, text=self.t("inventory.level"), style="Muted.TLabel").grid(row=8, column=0, sticky="w", padx=8, pady=(0, 2))
+        lvl = ttk.Entry(tab_data, textvariable=self._inventory_form_vars["level"])
+        lvl.grid(row=9, column=0, sticky="ew", padx=8, pady=(0, 6))
+        lvl.bind("<KeyRelease>", lambda _e: self._inventory_refresh_stats())
+
+        ttk.Label(tab_data, text=self.t("inventory.col.ball"), style="Muted.TLabel").grid(row=10, column=0, sticky="w", padx=8, pady=(0, 2))
+        ttk.Entry(tab_data, textvariable=self._inventory_form_vars["ball"]).grid(row=11, column=0, sticky="ew", padx=8, pady=(0, 6))
+        ttk.Label(tab_data, text=self.t("inventory.col.price"), style="Muted.TLabel").grid(row=12, column=0, sticky="w", padx=8, pady=(0, 2))
+        ttk.Entry(tab_data, textvariable=self._inventory_form_vars["price"]).grid(row=13, column=0, sticky="ew", padx=8, pady=(0, 6))
+        ttk.Label(tab_data, text=self.t("inventory.col.egg_groups"), style="Muted.TLabel").grid(row=14, column=0, sticky="w", padx=8, pady=(0, 2))
+        ttk.Label(tab_data, textvariable=self._inventory_form_vars["egg_groups"]).grid(row=15, column=0, sticky="w", padx=8, pady=(0, 6))
+        ttk.Label(tab_data, text=self.t("inventory.col.notes"), style="Muted.TLabel").grid(row=16, column=0, sticky="w", padx=8, pady=(0, 2))
+        notes_widget = tk.Text(tab_data, height=5, wrap="word", bg=self.theme["entry_bg"], fg=self.theme["fg"], insertbackground=self.theme["fg"], highlightthickness=1, highlightbackground=self.theme["border"])
+        notes_widget.grid(row=18, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        self._inventory_form_vars["notes_widget"] = notes_widget
+
+        ttk.Label(tab_ivs, text=self.t("inventory.iv_hint"), style="Muted.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", padx=8, pady=(8, 4))
+        iv_rows = [("hp", "HP"), ("atk", "Atk"), ("def", "Def"), ("spa", "SpA"), ("spd", "SpD"), ("spe", "Spe")]
+        for i, (k, lbl) in enumerate(iv_rows):
+            ttk.Label(tab_ivs, text=lbl).grid(row=i + 1, column=0, sticky="w", padx=8, pady=4)
+            sp = tk.Spinbox(tab_ivs, from_=0, to=31, textvariable=iv_vars[k], width=6, command=self._inventory_refresh_stats)
+            sp.grid(row=i + 1, column=1, sticky="w", padx=4, pady=4)
+            sp.bind("<KeyRelease>", lambda _e: self._inventory_refresh_stats())
+
+        self._inventory_stats_vars = {k: tk.StringVar(value="0") for k in ("hp", "atk", "def", "spa", "spd", "spe", "total")}
+        ttk.Label(tab_stats, text=self.t("inventory.stats_title"), style="Muted.TLabel").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 6))
+        for i, (k, lbl) in enumerate(iv_rows):
+            ttk.Label(tab_stats, text=f"{lbl}:").grid(row=i + 1, column=0, sticky="w", padx=8, pady=3)
+            ttk.Label(tab_stats, textvariable=self._inventory_stats_vars[k], style="Header.TLabel").grid(row=i + 1, column=1, sticky="w", padx=4, pady=3)
+        ttk.Label(tab_stats, text=self.t("info.stats.total") + ":").grid(row=8, column=0, sticky="w", padx=8, pady=(8, 4))
+        ttk.Label(tab_stats, textvariable=self._inventory_stats_vars["total"], style="Header.TLabel").grid(row=8, column=1, sticky="w", padx=4, pady=(8, 4))
+
+        actions = ttk.Frame(right, style="Panel.TFrame")
+        actions.grid(row=1, column=0, sticky="ew", pady=(8, 6))
+        ttk.Button(actions, text=self.t("inventory.btn.save"), command=self._inventory_save_current).pack(side="left", padx=(0, 6))
+        ttk.Button(actions, text=self.t("inventory.btn.duplicate"), command=self._inventory_duplicate_current).pack(side="left", padx=(0, 6))
+        ttk.Button(actions, text=self.t("inventory.btn.delete"), command=self._inventory_delete_current).pack(side="left")
+
+        prices_box = ttk.Frame(right, style="Panel.TFrame")
+        prices_box.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        ttk.Label(prices_box, text=self.t("inventory.price_title"), style="Muted.TLabel").grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
+        self._inventory_price_vars = {}
+        for i in range(1, 7):
+            ttk.Label(prices_box, text=f"{i}x31").grid(row=i, column=0, sticky="w")
+            var = tk.StringVar(value=str(self.inventory_settings.estimated_buy_price_by_iv_count.get(i, 0)))
+            self._inventory_price_vars[i] = var
+            ttk.Entry(prices_box, textvariable=var, width=10).grid(row=i, column=1, sticky="w", padx=(4, 10))
+        self._inventory_default_level_var = tk.StringVar(value=str(self.inventory_settings.default_level))
+        ttk.Label(prices_box, text=self.t("inventory.default_level"), style="Muted.TLabel").grid(row=7, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(prices_box, textvariable=self._inventory_default_level_var, width=10).grid(row=7, column=1, sticky="w", padx=(4, 10), pady=(6, 0))
+        ttk.Button(prices_box, text=self.t("inventory.btn.save_prices"), command=self._inventory_save_prices_pc).grid(row=8, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        self._inventory_sync_box_count()
+        self._inventory_clear_editor()
+        self._inventory_draw_box()
+
+    def _inventory_sync_box_count(self):
+        max_box = max([0] + [int(x.box_index or 0) for x in self.inventory_items])
+        self.inventory_settings.boxes_count = max(1, max_box + 1)
+        if self._inventory_box_index >= self.inventory_settings.boxes_count:
+            self._inventory_box_index = self.inventory_settings.boxes_count - 1
+        self._inventory_box_label_var.set(
+            self.t(
+                "inventory.box_label",
+                current=(self._inventory_box_index + 1),
+                total=self.inventory_settings.boxes_count,
+            )
+        )
+
+    def _inventory_items_in_box(self, box_index: int) -> List[InventoryItem]:
+        return sorted([x for x in self.inventory_items if int(x.box_index or 0) == int(box_index)], key=lambda x: int(x.slot_index if x.slot_index is not None else -1))
+
+    def _inventory_slot_to_xy(self, slot: int) -> Tuple[int, int]:
+        col = slot % self._inventory_cols
+        row = slot // self._inventory_cols
+        pad = 12
+        return pad + col * self._inventory_slot_size, pad + row * self._inventory_slot_size
+
+    def _inventory_xy_to_slot(self, x: float, y: float) -> Optional[int]:
+        pad = 12
+        rel_x = x - pad
+        rel_y = y - pad
+        if rel_x < 0 or rel_y < 0:
+            return None
+        col = int(rel_x // self._inventory_slot_size)
+        row = int(rel_y // self._inventory_slot_size)
+        if col < 0 or col >= self._inventory_cols or row < 0 or row >= self._inventory_rows:
+            return None
+        slot = row * self._inventory_cols + col
+        return slot if 0 <= slot < self._inventory_slots_per_box else None
+
+    def _inventory_get_item_by_id(self, item_id: str) -> Optional[InventoryItem]:
+        return next((x for x in self.inventory_items if x.id == item_id), None)
+
+    def _inventory_get_item_at_slot(self, box_index: int, slot_index: int) -> Optional[InventoryItem]:
+        for it in self.inventory_items:
+            if int(it.box_index or 0) == int(box_index) and int(it.slot_index) == int(slot_index):
+                return it
+        return None
+
+    def _inventory_first_free_slot(self, box_index: int) -> int:
+        occupied = {int(x.slot_index) for x in self.inventory_items if int(x.box_index or 0) == int(box_index) and int(x.slot_index) >= 0}
+        for s in range(self._inventory_slots_per_box):
+            if s not in occupied:
+                return s
+        return -1
+
+    def _inventory_draw_box(self):
+        c = self._inventory_canvas
+        if c is None:
+            return
+        self._inventory_sync_box_count()
+        c.delete("all")
+        self._inventory_images.clear()
+        width = 24 + self._inventory_cols * self._inventory_slot_size
+        height = 24 + self._inventory_rows * self._inventory_slot_size
+        c.configure(scrollregion=(0, 0, width, height))
+        for slot in range(self._inventory_slots_per_box):
+            x, y = self._inventory_slot_to_xy(slot)
+            x1 = x + self._inventory_slot_size - 8
+            y1 = y + self._inventory_slot_size - 8
+            c.create_rectangle(x, y, x1, y1, outline=self.theme["border"], fill=self.theme["panel_alt"], tags=("slot", f"slot:{slot}"))
+
+        for it in self._inventory_items_in_box(self._inventory_box_index):
+            slot = int(it.slot_index)
+            if slot < 0 or slot >= self._inventory_slots_per_box:
+                continue
+            x, y = self._inventory_slot_to_xy(slot)
+            x1 = x + self._inventory_slot_size - 8
+            y1 = y + self._inventory_slot_size - 8
+            outline = self.theme["accent"] if it.id == self._inventory_selected_item_id else self.theme["border"]
+            c.create_rectangle(x + 2, y + 2, x1 - 2, y1 - 2, outline=outline, width=2 if it.id == self._inventory_selected_item_id else 1, fill=self.theme["entry_bg"], tags=("inv_item", f"item:{it.id}", f"slot:{slot}"))
+            photo = self._load_sprite_photo(int(it.species_id), (52, 52), allow_download=True) if it.species_id else None
+            if photo is not None:
+                self._inventory_images[it.id] = photo
+                c.create_image((x + x1) // 2, y + 30, image=photo, tags=("inv_item", f"item:{it.id}", f"slot:{slot}"))
+            else:
+                c.create_text((x + x1) // 2, y + 30, text="?", fill=self.theme["fg"], font=(self._ui_font_family, 14, "bold"), tags=("inv_item", f"item:{it.id}", f"slot:{slot}"))
+            c.create_text((x + x1) // 2, y1 - 26, text=(it.species_name or "?")[:10], fill=self.theme["fg"], font=(self._ui_font_family, 8, "bold"), tags=("inv_item", f"item:{it.id}", f"slot:{slot}"))
+            c.create_text((x + x1) // 2, y1 - 12, text=f"{it.iv_count_31()}x31", fill=self.theme["muted"], font=(self._ui_font_family, 7), tags=("inv_item", f"item:{it.id}", f"slot:{slot}"))
+
+    def _inventory_create_item_at_slot(self, slot: int):
+        species = self.selected if self.selected else (self.items[0] if self.items else None)
+        species_id = int(species.id) if species else None
+        species_name = species.name if species else ""
+        egg_groups = []
+        if species_id:
+            try:
+                egg_groups = self.species_info.get_egg_groups(species_id)
+            except Exception:
+                egg_groups = []
+        item = InventoryItem.create()
+        item.species_id = species_id
+        item.species_name = species_name
+        item.gender = "U"
+        item.nature = ""
+        item.level = int(self.inventory_settings.default_level or 50)
+        item.ivs = {k: 0 for k in STAT_KEYS}
+        item.egg_groups = egg_groups
+        item.ball = ""
+        item.price_paid = 0
+        item.notes = ""
+        item.box_index = self._inventory_box_index
+        item.slot_index = slot
+        item.sprite_cache_key = str(species_id or "")
+        self.inventory_items.append(item)
+        self.inventory_store.save_items(self.inventory_items)
+        self._inventory_selected_item_id = item.id
+        self._inventory_load_editor(item)
+        self._inventory_draw_box()
+        if self.selected:
+            self._request_recompute(reason="inventory")
+
+    def _inventory_on_canvas_press(self, event):
+        c = self._inventory_canvas
+        if c is None:
+            return
+        slot = self._inventory_xy_to_slot(c.canvasx(event.x), c.canvasy(event.y))
+        if slot is None:
+            return
+        item = self._inventory_get_item_at_slot(self._inventory_box_index, slot)
+        if item is None:
+            self._inventory_create_item_at_slot(slot)
+            return
+        self._inventory_selected_item_id = item.id
+        self._inventory_load_editor(item)
+        self._inventory_draw_box()
+        self._inventory_drag = {
+            "item_id": item.id,
+            "source_slot": slot,
+            "start_x": c.canvasx(event.x),
+            "start_y": c.canvasy(event.y),
+            "ghost": None,
+            "moved": False,
+        }
+
+    def _inventory_on_canvas_motion(self, event):
+        c = self._inventory_canvas
+        if c is None:
+            return
+        drag = self._inventory_drag or {}
+        if not drag.get("item_id"):
+            return
+        x = c.canvasx(event.x)
+        y = c.canvasy(event.y)
+        sx = float(drag.get("start_x", x))
+        sy = float(drag.get("start_y", y))
+        if abs(x - sx) + abs(y - sy) < 6:
+            return
+        drag["moved"] = True
+        ghost = drag.get("ghost")
+        if ghost is None:
+            ghost = c.create_rectangle(
+                x - 20, y - 20, x + 20, y + 20,
+                outline=self.theme["accent"], width=2, dash=(3, 2), tags=("drag_ghost",)
+            )
+            drag["ghost"] = ghost
+        else:
+            c.coords(ghost, x - 20, y - 20, x + 20, y + 20)
+        self._inventory_drag = drag
+
+    def _inventory_on_canvas_release(self, event):
+        c = self._inventory_canvas
+        if c is None:
+            return
+        drag = self._inventory_drag or {}
+        item_id = drag.get("item_id")
+        if not item_id:
+            self._inventory_drag = {}
+            return
+        ghost = drag.get("ghost")
+        if ghost is not None:
+            c.delete(ghost)
+        moved = bool(drag.get("moved"))
+        source_slot = int(drag.get("source_slot", -1))
+        target_slot = self._inventory_xy_to_slot(c.canvasx(event.x), c.canvasy(event.y))
+
+        if moved and target_slot is not None and source_slot >= 0 and target_slot != source_slot:
+            src_item = self._inventory_get_item_by_id(item_id)
+            dst_item = self._inventory_get_item_at_slot(self._inventory_box_index, target_slot)
+            if src_item is not None:
+                src_item.slot_index = target_slot
+                src_item.box_index = self._inventory_box_index
+                if dst_item is not None and dst_item.id != src_item.id:
+                    dst_item.slot_index = source_slot
+                    dst_item.box_index = self._inventory_box_index
+                self.inventory_store.save_items(self.inventory_items)
+                if self.selected:
+                    self._request_recompute(reason="inventory")
+        self._inventory_drag = {}
+        self._inventory_draw_box()
+
+    def _inventory_species_id_from_name(self, species_name: str) -> Optional[int]:
+        name = (species_name or "").strip().lower()
+        if not name:
+            return None
+        for p in self.items:
+            if p.name.lower() == name:
+                return int(p.id)
+        return None
+
+    def _inventory_on_species_changed(self):
+        fv = self._inventory_form_vars
+        species_name = str(fv["species"].get() or "").strip().lower()
+        pid = self._inventory_species_id_from_name(species_name)
+        fv["species_id_label"].set(f"#{pid}" if pid else "—")
+        egg_groups = []
+        if pid:
+            try:
+                egg_groups = self.species_info.get_egg_groups(pid)
+            except Exception:
+                egg_groups = []
+        fv["egg_groups"].set(", ".join(egg_groups) if egg_groups else "—")
+        self._inventory_update_detail_sprite(pid)
+        self._inventory_refresh_stats()
+
+    def _inventory_update_detail_sprite(self, species_id: Optional[int]):
+        lbl = getattr(self, "_inventory_detail_sprite_label", None)
+        if lbl is None:
+            return
+        photo = self._load_sprite_photo(
+            int(species_id),
+            (96, 96),
+            allow_download=True,
+            compose_bg=self.theme["panel"],
+        ) if species_id else None
+        self._inventory_detail_img = photo
+        if photo is not None:
+            lbl.configure(image=photo)
+        else:
+            lbl.configure(image="")
+
+    def _inventory_load_editor(self, item: InventoryItem):
+        fv = self._inventory_form_vars
+        fv["id"].set(item.id)
+        fv["species"].set(item.species_name or "")
+        fv["species_id_label"].set(f"#{int(item.species_id)}" if item.species_id else "—")
+        fv["gender"].set(item.gender if item.gender in ("M", "F", "U") else "U")
+        fv["nature"].set(item.nature or "")
+        fv["level"].set(str(item.level or self.inventory_settings.default_level))
+        fv["ball"].set(item.ball or "")
+        fv["price"].set(str(int(item.price_paid or 0)))
+        fv["egg_groups"].set(", ".join(item.egg_groups or []) if item.egg_groups else "—")
+        iv_vars = fv.get("ivs", {})
+        for k in STAT_KEYS:
+            if k in iv_vars:
+                iv_vars[k].set(int(item.ivs.get(k, 0)))
+        notes_widget = fv.get("notes_widget")
+        if notes_widget is not None:
+            notes_widget.delete("1.0", tk.END)
+            notes_widget.insert(tk.END, item.notes or "")
+        self._inventory_update_detail_sprite(item.species_id)
+        self._inventory_refresh_stats()
+
+    def _inventory_clear_editor(self):
+        fv = self._inventory_form_vars
+        if not fv:
+            return
+        fv["id"].set("")
+        fv["species"].set("")
+        fv["species_id_label"].set("—")
+        fv["gender"].set("U")
+        fv["nature"].set("")
+        fv["level"].set(str(int(self.inventory_settings.default_level or 50)))
+        fv["ball"].set("")
+        fv["price"].set("0")
+        fv["egg_groups"].set("—")
+        iv_vars = fv.get("ivs", {})
+        for k in STAT_KEYS:
+            if k in iv_vars:
+                iv_vars[k].set(0)
+        notes_widget = fv.get("notes_widget")
+        if notes_widget is not None:
+            notes_widget.delete("1.0", tk.END)
+        self._inventory_update_detail_sprite(None)
+        for k in ("hp", "atk", "def", "spa", "spd", "spe", "total"):
+            if k in self._inventory_stats_vars:
+                self._inventory_stats_vars[k].set("0")
+
+    def _inventory_collect_form_item(self) -> Optional[InventoryItem]:
+        fv = self._inventory_form_vars
+        raw_id = str(fv["id"].get() or "").strip()
+        species_name = str(fv["species"].get() or "").strip().lower()
+        species_id = self._inventory_species_id_from_name(species_name)
+        try:
+            level = max(1, min(100, int(str(fv["level"].get() or "50").strip())))
+        except Exception:
+            level = int(self.inventory_settings.default_level or 50)
+        try:
+            price_paid = max(0, int(str(fv["price"].get() or "0").strip()))
+        except Exception:
+            price_paid = 0
+
+        iv_values: Dict[str, int] = {k: 0 for k in STAT_KEYS}
+        iv_vars = fv.get("ivs", {})
+        for k in STAT_KEYS:
+            try:
+                iv_values[k] = max(0, min(31, int(iv_vars[k].get())))
+            except Exception:
+                iv_values[k] = 0
+
+        item = self._inventory_get_item_by_id(raw_id) if raw_id else None
+        if item is None:
+            item = InventoryItem.create()
+            item.box_index = self._inventory_box_index
+            item.slot_index = self._inventory_first_free_slot(self._inventory_box_index)
+            if item.slot_index < 0:
+                self.inventory_settings.boxes_count += 1
+                self._inventory_box_index = self.inventory_settings.boxes_count - 1
+                item.box_index = self._inventory_box_index
+                item.slot_index = 0
+
+        item.species_id = species_id
+        item.species_name = species_name
+        item.gender = str(fv["gender"].get() or "U")
+        if item.gender not in ("M", "F", "U"):
+            item.gender = "U"
+        item.nature = str(fv["nature"].get() or "")
+        item.level = level
+        item.ivs = iv_values
+        item.ball = str(fv["ball"].get() or "")
+        item.price_paid = price_paid
+        notes_widget = fv.get("notes_widget")
+        if notes_widget is not None:
+            item.notes = str(notes_widget.get("1.0", tk.END)).strip()
+        item.sprite_cache_key = str(item.species_id or "")
+        if item.species_id:
+            try:
+                item.egg_groups = self.species_info.get_egg_groups(item.species_id)
+            except Exception:
+                item.egg_groups = []
+        else:
+            item.egg_groups = []
+        return item
+
+    def _inventory_refresh_stats(self):
+        fv = self._inventory_form_vars
+        species_name = str(fv.get("species", tk.StringVar(value="")).get() or "").strip().lower()
+        species_id = self._inventory_species_id_from_name(species_name)
+        base = {k: 0 for k in STAT_KEYS}
+        if species_id:
+            try:
+                details = self.species_info.get_pokemon_details(species_id, version_group="black-white", language=self._lang)
+                for s in details.get("stats", []) or []:
+                    rk = normalize_stat_key(s.get("raw", ""))
+                    if rk:
+                        base[rk] = int(s.get("value", 0) or 0)
+                egg_groups = tuple(details.get("summary", {}).get("egg_groups", []) or [])
+                fv["egg_groups"].set(", ".join(egg_groups) if egg_groups else "—")
+            except Exception:
+                pass
+
+        iv_vars = fv.get("ivs", {})
+        ivs = {}
+        for k in STAT_KEYS:
+            try:
+                ivs[k] = max(0, min(31, int(iv_vars[k].get())))
+            except Exception:
+                ivs[k] = 0
+        try:
+            level = max(1, min(100, int(str(fv["level"].get() or "50").strip())))
+        except Exception:
+            level = int(self.inventory_settings.default_level or 50)
+        stats = calculate_stats(base_stats=base, ivs=ivs, level=level, nature_text=str(fv["nature"].get() or ""))
+        for k in ("hp", "atk", "def", "spa", "spd", "spe", "total"):
+            if k in self._inventory_stats_vars:
+                self._inventory_stats_vars[k].set(str(int(stats.get(k, 0))))
+
+    def _inventory_save_current(self):
+        item = self._inventory_collect_form_item()
+        if item is None:
+            return
+        idx = next((i for i, x in enumerate(self.inventory_items) if x.id == item.id), None)
+        if idx is None:
+            self.inventory_items.append(item)
+        else:
+            self.inventory_items[idx] = item
+        self.inventory_store.save_items(self.inventory_items)
+        self._inventory_selected_item_id = item.id
+        self._inventory_draw_box()
+        if self.selected:
+            self._request_recompute(reason="inventory")
+
+    def _inventory_duplicate_current(self):
+        item = self._inventory_get_item_by_id(self._inventory_selected_item_id or "")
+        if item is None:
+            return
+        slot = self._inventory_first_free_slot(self._inventory_box_index)
+        if slot < 0:
+            self.inventory_settings.boxes_count += 1
+            self._inventory_box_index = self.inventory_settings.boxes_count - 1
+            slot = 0
+        new_item = InventoryItem.create()
+        new_item.species_id = item.species_id
+        new_item.species_name = item.species_name
+        new_item.gender = item.gender
+        new_item.nature = item.nature
+        new_item.level = item.level
+        new_item.ivs = dict(item.ivs)
+        new_item.egg_groups = list(item.egg_groups)
+        new_item.ball = item.ball
+        new_item.price_paid = item.price_paid
+        new_item.notes = item.notes
+        new_item.box_index = self._inventory_box_index
+        new_item.slot_index = slot
+        new_item.sprite_cache_key = item.sprite_cache_key
+        self.inventory_items.append(new_item)
+        self.inventory_store.save_items(self.inventory_items)
+        self._inventory_selected_item_id = new_item.id
+        self._inventory_load_editor(new_item)
+        self._inventory_draw_box()
+        if self.selected:
+            self._request_recompute(reason="inventory")
+
+    def _inventory_delete_current(self):
+        item_id = self._inventory_selected_item_id
+        if not item_id:
+            return
+        self.inventory_items = [x for x in self.inventory_items if x.id != item_id]
+        self.inventory_store.save_items(self.inventory_items)
+        self._inventory_selected_item_id = None
+        self._inventory_clear_editor()
+        self._inventory_draw_box()
+        if self.selected:
+            self._request_recompute(reason="inventory")
+
+    def _inventory_prev_box(self):
+        self._inventory_sync_box_count()
+        self._inventory_box_index = max(0, self._inventory_box_index - 1)
+        self._inventory_draw_box()
+
+    def _inventory_next_box(self):
+        self._inventory_sync_box_count()
+        if self._inventory_box_index + 1 >= self.inventory_settings.boxes_count:
+            self.inventory_settings.boxes_count += 1
+        self._inventory_box_index = min(self.inventory_settings.boxes_count - 1, self._inventory_box_index + 1)
+        self._inventory_draw_box()
+
+    def _inventory_import_pc(self):
+        path = filedialog.askopenfilename(
+            parent=self._inventory_window,
+            title=self.t("inventory.import_title"),
+            filetypes=[("JSON", "*.json"), ("All Files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            self.inventory_items = self.inventory_store.import_items(path)
+            self._inventory_selected_item_id = None
+            self._inventory_clear_editor()
+            self._inventory_draw_box()
+            if self.selected:
+                self._request_recompute(reason="inventory")
+        except Exception as exc:
+            messagebox.showerror(self.t("dialog.error"), str(exc))
+
+    def _inventory_export_pc(self):
+        path = filedialog.asksaveasfilename(
+            parent=self._inventory_window,
+            title=self.t("inventory.export_title"),
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json"), ("All Files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            self.inventory_store.export_items(path, self.inventory_items)
+        except Exception as exc:
+            messagebox.showerror(self.t("dialog.error"), str(exc))
+
+    def _inventory_save_prices_pc(self):
+        for k, var in self._inventory_price_vars.items():
+            try:
+                v = int(var.get().strip() or 0)
+            except Exception:
+                v = 0
+            self.inventory_settings.estimated_buy_price_by_iv_count[k] = max(0, v)
+        try:
+            dlevel = int(str(self._inventory_default_level_var.get()).strip())
+        except Exception:
+            dlevel = 50
+        self.inventory_settings.default_level = max(1, min(100, dlevel))
+        self.inventory_store.save_settings(self.inventory_settings)
+        if self.selected:
+            self._request_recompute(reason="inventory-prices")
+
+    def _load_species_meta_async(self, pid: int, pname: str, selection_gen: Optional[int] = None):
         def task():
             egg_groups = []
             types = []
@@ -2351,11 +3784,13 @@ class App(tk.Tk):
                 print(f"[SpeciesInfoService] Failed types for #{pid}: {exc}")
 
             def apply():
+                if selection_gen is not None and selection_gen != self._selection_generation_id:
+                    return
                 if not self.selected or self.selected.id != pid:
                     return
-                type_txt = "/".join(t.title() for t in types) if types else "?"
+                type_txt = "/".join(self._localize_type_name(t) for t in types) if types else "?"
                 self._name_type_text_var.set(f"{pname} (#{pid}) [{type_txt}]")
-                self._egg_groups_var.set("Grupos Huevo: " + (", ".join(egg_groups) if egg_groups else "—"))
+                self._egg_groups_var.set(self.t("left.egg_groups", groups=(", ".join(egg_groups) if egg_groups else "—")))
                 color = TYPE_COLORS.get(types[0], "#666") if types else "#666"
                 self.type_dot.itemconfig(self.type_dot_id, fill=color, outline=color)
             self.after(0, apply)
@@ -2374,7 +3809,7 @@ class App(tk.Tk):
         self._info_details = None
         self._info_images = []
         self._info_header_var.set(f"N. {pid:03d} {pname}")
-        self._set_info_loading("Cargando información del Pokémon...")
+        self._set_info_loading(self.t("info.loading"))
         self._switch_info_tab(self._info_active_tab or "datos")
         self._apply_info_window_theme()
         self._load_info_async(pid)
@@ -2384,7 +3819,7 @@ class App(tk.Tk):
 
     def _build_info_window_shell(self):
         win = tk.Toplevel(self)
-        win.title("Info Pokémon")
+        win.title(self.t("info.window_title"))
         win.geometry("980x680")
         win.minsize(760, 520)
         win.protocol("WM_DELETE_WINDOW", self._close_info_window)
@@ -2404,7 +3839,7 @@ class App(tk.Tk):
             textvariable=self._info_header_var,
             bg=self.theme["panel_alt"],
             fg=self.theme["fg"],
-            font=("Segoe UI", 13, "bold"),
+            font=(self._ui_font_family, 13, "bold"),
             anchor="w",
         )
         title_lbl.pack(side="left", padx=10, pady=6)
@@ -2419,7 +3854,7 @@ class App(tk.Tk):
             bd=0,
             padx=10,
             pady=3,
-            font=("Segoe UI", 10, "bold"),
+            font=(self._ui_font_family, 10, "bold"),
         )
         close_btn.pack(side="right", padx=8, pady=6)
         self._info_close_btn = close_btn
@@ -2428,13 +3863,8 @@ class App(tk.Tk):
         tabbar.pack(fill="x", pady=(6, 4))
         self._info_tabbar_frame = tabbar
 
-        tab_defs = [
-            ("datos", "Datos"),
-            ("movimientos", "Movimientos"),
-            ("stats", "Estad. Base"),
-            ("sitios", "Sitios"),
-            ("evoluciones", "Evoluciones"),
-        ]
+        tab_defs = self._get_info_tab_defs()
+        self._info_tab_labels = {k: label for k, label in tab_defs}
         self._info_tab_buttons = {}
         for key, label in tab_defs:
             btn = tk.Button(
@@ -2445,7 +3875,7 @@ class App(tk.Tk):
                 padx=16,
                 pady=8,
                 cursor="hand2",
-                font=("Segoe UI", 10, "bold"),
+                font=(self._ui_font_family, 10, "bold"),
                 command=lambda k=key: self._switch_info_tab(k),
             )
             btn.pack(side="left", padx=(0, 4))
@@ -2468,7 +3898,7 @@ class App(tk.Tk):
             anchor="w",
             bg=self.theme["panel_alt"],
             fg=self.theme["muted"],
-            font=("Segoe UI", 9),
+            font=(self._ui_font_family, 9),
             padx=8,
             pady=5,
         )
@@ -2477,13 +3907,33 @@ class App(tk.Tk):
 
         self._info_active_tab = "datos"
         self._switch_info_tab("datos")
-        self._set_info_loading("Selecciona un Pokémon para ver detalles.")
+        self._set_info_loading(self.t("info.select_prompt"))
         self._apply_info_window_theme()
 
+    def _get_info_tab_defs(self) -> List[Tuple[str, str]]:
+        return [
+            ("datos", self.t("info.tab.data")),
+            ("movimientos", self.t("info.tab.moves")),
+            ("stats", self.t("info.tab.stats")),
+            ("sitios", self.t("info.tab.sites")),
+            ("evoluciones", self.t("info.tab.evolutions")),
+        ]
+
+    def _build_info_window_texts(self):
+        if not self._info_window or not self._info_window.winfo_exists():
+            return
+        self._info_window.title(self.t("info.window_title"))
+        tab_defs = self._get_info_tab_defs()
+        self._info_tab_labels = {k: label for k, label in tab_defs}
+        for key, btn in self._info_tab_buttons.items():
+            if key in self._info_tab_labels:
+                btn.configure(text=self._info_tab_labels[key], font=(self._ui_font_family, 10, "bold"))
+
     def _load_info_async(self, pid: int):
+        lang_snapshot = self._lang
         def task():
             try:
-                details = self.species_info.get_pokemon_details(pid, version_group="black-white")
+                details = self.species_info.get_pokemon_details(pid, version_group="black-white", language=lang_snapshot)
                 self.after(0, lambda: self._populate_pokemon_info(pid, details))
             except Exception as exc:
                 self.after(0, lambda: self._populate_pokemon_info_error(pid, exc))
@@ -2505,7 +3955,7 @@ class App(tk.Tk):
                 text=message,
                 bg=self.theme["panel"],
                 fg=self.theme["muted"],
-                font=("Segoe UI", 11),
+                font=(self._ui_font_family, 11),
             )
             lbl.pack(expand=True)
             self._info_loading_label = lbl
@@ -2556,6 +4006,7 @@ class App(tk.Tk):
                 activeforeground=self.theme["fg"],
                 highlightthickness=1,
                 highlightbackground=self.theme["border"],
+                font=(self._ui_font_family, 10, "bold"),
             )
 
     def _close_info_window(self):
@@ -2580,7 +4031,7 @@ class App(tk.Tk):
             return
         if self._info_species_id != pid:
             return
-        self._set_info_loading(f"No se pudo cargar la información del Pokémon.\n{exc}")
+        self._set_info_loading(self.t("info.load_error", err=str(exc)))
 
     def _populate_pokemon_info(self, pid: int, details: dict):
         if not self._info_window or not self._info_window.winfo_exists():
@@ -2600,17 +4051,36 @@ class App(tk.Tk):
             self._info_tab_rendered[k] = False
         fallback_used = bool(summary.get("sites_fallback_used"))
         if fallback_used:
-            self._info_status_var.set("Información cargada (fuente: PokeAPI). Sitios usa fallback de otras versiones.")
+            self._info_status_var.set(self.t("info.loaded_fallback"))
         else:
-            self._info_status_var.set("Información cargada (fuente: PokeAPI).")
+            self._info_status_var.set(self.t("info.loaded"))
         self._switch_info_tab(self._info_active_tab or "datos")
 
-    def _load_sprite_photo(self, species_id: int, size: Tuple[int, int], allow_download: bool = True) -> Optional[ImageTk.PhotoImage]:
+    def _compose_sprite_on_bg(self, img: Image.Image, size: Tuple[int, int], bg_hex: Optional[str] = None) -> Image.Image:
+        sprite = img.convert("RGBA").resize(size, Image.NEAREST)
+        if not bg_hex:
+            return sprite
+        try:
+            r, g, b = self.theme_manager._hex_to_rgb(bg_hex)
+        except Exception:
+            r, g, b = (24, 28, 34)
+        base = Image.new("RGBA", size, (r, g, b, 255))
+        base.alpha_composite(sprite)
+        return base
+
+    def _load_sprite_photo(
+        self,
+        species_id: int,
+        size: Tuple[int, int],
+        allow_download: bool = True,
+        compose_bg: Optional[str] = None,
+    ) -> Optional[ImageTk.PhotoImage]:
         path = os.path.join(SPRITE_CACHE_DIR, f"{species_id}.png")
         if not os.path.exists(path):
             path = self.sprites.get_sprite_path(species_id) if allow_download else self.sprites.get_default_path()
         try:
-            img = Image.open(path).convert("RGBA").resize(size, Image.NEAREST)
+            img = Image.open(path)
+            img = self._compose_sprite_on_bg(img, size, bg_hex=compose_bg)
             photo = ImageTk.PhotoImage(img)
             self._info_images.append(photo)
             return photo
@@ -2647,11 +4117,16 @@ class App(tk.Tk):
             text=f"N. {pid_label} {summary.get('name', details.get('name', '—'))}",
             bg=self.theme["panel_alt"],
             fg=self.theme["fg"],
-            font=("Segoe UI", 11, "bold"),
+            font=(self._ui_font_family, 11, "bold"),
             pady=8,
         ).pack(fill="x")
 
-        sprite = self._load_sprite_photo(pid_num, (112, 112), allow_download=True) if pid_num > 0 else None
+        sprite = self._load_sprite_photo(
+            pid_num,
+            (112, 112),
+            allow_download=True,
+            compose_bg=self.theme["panel_alt"],
+        ) if pid_num > 0 else None
         sprite_box = tk.Label(left, image=sprite, bg=self.theme["panel_alt"])
         sprite_box.pack(padx=18, pady=(6, 10))
 
@@ -2660,12 +4135,12 @@ class App(tk.Tk):
         for t in summary.get("types", []) or []:
             pill = tk.Label(
                 types_wrap,
-                text=t.title(),
+                text=self._localize_type_name(t),
                 bg=TYPE_COLORS.get(t, self.theme["accent"]),
                 fg="#101014",
                 padx=8,
                 pady=2,
-                font=("Segoe UI", 9, "bold"),
+                font=(self._ui_font_family, 9, "bold"),
             )
             pill.pack(side="left", padx=(0, 6), pady=2)
 
@@ -2682,15 +4157,15 @@ class App(tk.Tk):
         except Exception:
             w_txt = "—"
         rows = [
-            ("Tipo", "/".join([t.title() for t in (summary.get("types", []) or [])]) or "—"),
-            ("Desc", summary.get("flavor_text", "—")),
-            ("Altura", h_txt),
-            ("Peso", w_txt),
-            ("Habilidades", summary.get("abilities", "—")),
-            ("Habilidad Oculta", summary.get("hidden_ability", "—")),
-            ("Grupo Huevo", ", ".join(summary.get("egg_groups", [])) or "—"),
-            ("EV que da", summary.get("ev_yield", "—")),
-            ("Captura", str(summary.get("capture_rate", "—"))),
+            (self.t("info.data.type"), "/".join([self._localize_type_name(t) for t in (summary.get("types", []) or [])]) or "—"),
+            (self.t("info.data.desc"), summary.get("flavor_text", "—")),
+            (self.t("info.data.height"), h_txt),
+            (self.t("info.data.weight"), w_txt),
+            (self.t("info.data.abilities"), summary.get("abilities", "—")),
+            (self.t("info.data.hidden_ability"), summary.get("hidden_ability", "—")),
+            (self.t("info.data.egg_group"), ", ".join(summary.get("egg_groups", [])) or "—"),
+            (self.t("info.data.ev_yield"), summary.get("ev_yield", "—")),
+            (self.t("info.data.capture"), str(summary.get("capture_rate", "—"))),
         ]
         for i, (label, value) in enumerate(rows):
             row_bg = self.theme["info_table_row_bg"] if i % 2 == 0 else self.theme["info_table_row_alt_bg"]
@@ -2705,7 +4180,7 @@ class App(tk.Tk):
                 fg=self.theme["fg"],
                 padx=8,
                 pady=6,
-                font=("Segoe UI", 10, "bold"),
+                font=(self._ui_font_family, 10, "bold"),
             ).pack(side="left")
             tk.Label(
                 row,
@@ -2717,7 +4192,7 @@ class App(tk.Tk):
                 fg=self.theme["fg"],
                 padx=8,
                 pady=6,
-                font=("Segoe UI", 10),
+                font=(self._ui_font_family, 10),
             ).pack(side="left", fill="x", expand=True)
 
     def _render_info_tab_moves(self, frame: tk.Frame, details: dict):
@@ -2768,10 +4243,10 @@ class App(tk.Tk):
         canvas.bind("<Configure>", _sync)
 
         sections = [
-            ("level", "Nivel", "Nivel"),
-            ("egg", "Movimientos huevo", "Origen"),
-            ("tm", "TM (MT)", "Origen"),
-            ("hm", "HM (MO)", "Origen"),
+            ("level", self.t("info.moves.section.level"), self.t("info.moves.col.level")),
+            ("egg", self.t("info.moves.section.egg"), self.t("info.moves.col.source")),
+            ("tm", self.t("info.moves.section.tm"), self.t("info.moves.col.source")),
+            ("hm", self.t("info.moves.section.hm"), self.t("info.moves.col.source")),
         ]
         for idx, (bucket, title, level_col) in enumerate(sections):
             rows = self._info_moves_by_bucket.get(bucket, [])
@@ -2790,7 +4265,7 @@ class App(tk.Tk):
                 anchor="w",
                 padx=10,
                 pady=6,
-                font=("Segoe UI", 10, "bold"),
+                font=(self._ui_font_family, 10, "bold"),
             ).pack(fill="x")
             table_wrap = tk.Frame(section, bg=section["bg"])
             table_wrap.pack(fill="both", expand=True, padx=8, pady=8)
@@ -2798,11 +4273,11 @@ class App(tk.Tk):
             tree = ttk.Treeview(table_wrap, columns=cols, show="tree headings", style="Info.Treeview", height=max(3, min(8, len(rows) + 1)))
             tree.heading("#0", text="", anchor="center")
             tree.heading("level", text=level_col)
-            tree.heading("name", text="Nombre")
-            tree.heading("type", text="Tipo")
-            tree.heading("power", text="Poder")
+            tree.heading("name", text=self.t("info.moves.col.name"))
+            tree.heading("type", text=self.t("info.moves.col.type"))
+            tree.heading("power", text=self.t("info.moves.col.power"))
             tree.heading("pp", text="PP")
-            tree.heading("accuracy", text="Precisión")
+            tree.heading("accuracy", text=self.t("info.moves.col.accuracy"))
             tree.column("#0", width=52, minwidth=42, anchor="center", stretch=False)
             tree.column("level", width=88, minwidth=72, anchor="center", stretch=False)
             tree.column("name", width=250, minwidth=180, anchor="w")
@@ -2831,19 +4306,19 @@ class App(tk.Tk):
         rows = self._info_moves_by_bucket.get(bucket, []) or []
         image_refs: List[ImageTk.PhotoImage] = []
         if not rows:
-            tree.insert("", "end", text="", values=("—", "Sin movimientos en esta categoría", "—", "—", "—", "—"), tags=("even",))
+            tree.insert("", "end", text="", values=("—", self.t("info.moves.empty"), "—", "—", "—", "—"), tags=("even",))
             tree._img_refs = image_refs  # type: ignore[attr-defined]
             return
 
         for i, row in enumerate(rows):
             if bucket == "level":
-                lvl_txt = f"Nv. {int(row.get('level', 0) or 0)}"
+                lvl_txt = self.t("info.moves.level_fmt", level=int(row.get('level', 0) or 0))
             elif bucket == "egg":
-                lvl_txt = "HUEVO"
+                lvl_txt = self.t("info.moves.bucket.egg")
             elif bucket == "tm":
-                lvl_txt = "MT"
+                lvl_txt = self.t("info.moves.bucket.tm")
             elif bucket == "hm":
-                lvl_txt = "MO"
+                lvl_txt = self.t("info.moves.bucket.hm")
             else:
                 lvl_txt = row.get("method_level", "—")
             icon = self._get_type_icon_photo(row.get("type_icon_key", ""), size=(40, 16))
@@ -2852,7 +4327,7 @@ class App(tk.Tk):
             vals = (
                 lvl_txt,
                 row.get("name", "—"),
-                row.get("type", "—"),
+                self._localize_type_name(row.get("raw_type", row.get("type", ""))),
                 row.get("power", "—"),
                 row.get("pp", "—"),
                 row.get("accuracy", "—"),
@@ -2867,7 +4342,7 @@ class App(tk.Tk):
         wrap.pack(fill="both", expand=True, padx=12, pady=12)
 
         total = sum(int(s.get("value", 0) or 0) for s in stats)
-        rows = list(stats) + [{"name": "Total", "value": total}]
+        rows = list(stats) + [{"name": self.t("info.stats.total"), "value": total}]
         for s in rows:
             name = s.get("name", "—")
             val = int(s.get("value", 0) or 0)
@@ -2880,7 +4355,7 @@ class App(tk.Tk):
                 anchor="w",
                 bg=self.theme["info_table_row_bg"],
                 fg=self.theme["fg"],
-                font=("Segoe UI", 10, "bold"),
+                font=(self._ui_font_family, 10, "bold"),
                 padx=8,
                 pady=7,
             ).pack(side="left")
@@ -2891,7 +4366,7 @@ class App(tk.Tk):
                 anchor="center",
                 bg=self.theme["info_table_row_bg"],
                 fg=self.theme["fg"],
-                font=("Segoe UI", 10, "bold"),
+                font=(self._ui_font_family, 10, "bold"),
                 pady=7,
             ).pack(side="left", padx=(0, 8))
             bar = tk.Canvas(
@@ -2915,11 +4390,10 @@ class App(tk.Tk):
         if not rows:
             tk.Label(
                 frame,
-                text="No se encontraron ubicaciones para esta especie en la versión seleccionada;\n"
-                     "tampoco hay datos alternativos disponibles en PokeAPI.",
+                text=self.t("info.sites.empty"),
                 bg=self.theme["panel"],
                 fg=self.theme["muted"],
-                font=("Segoe UI", 11),
+                font=(self._ui_font_family, 11),
             ).pack(expand=True, pady=24)
             return
 
@@ -2928,11 +4402,11 @@ class App(tk.Tk):
         if summary.get("sites_fallback_used"):
             tk.Label(
                 wrap,
-                text="Mostrando ubicaciones de otras versiones por ausencia en black/white.",
+                text=self.t("info.sites.fallback"),
                 bg=self.theme["panel"],
                 fg=self.theme["muted"],
                 anchor="w",
-                font=("Segoe UI", 9, "bold"),
+                font=(self._ui_font_family, 9, "bold"),
             ).grid(row=0, column=0, sticky="ew", pady=(0, 6))
             start_row = 1
         else:
@@ -2940,12 +4414,12 @@ class App(tk.Tk):
 
         cols = ("method", "region", "version", "location", "levels", "chance")
         tree = ttk.Treeview(wrap, columns=cols, show="headings", style="Info.Treeview")
-        tree.heading("method", text="Tipo")
-        tree.heading("region", text="Región")
-        tree.heading("version", text="Versión")
-        tree.heading("location", text="Sitio")
-        tree.heading("levels", text="Niveles")
-        tree.heading("chance", text="Rareza")
+        tree.heading("method", text=self.t("info.sites.col.type"))
+        tree.heading("region", text=self.t("info.sites.col.region"))
+        tree.heading("version", text=self.t("info.sites.col.version"))
+        tree.heading("location", text=self.t("info.sites.col.location"))
+        tree.heading("levels", text=self.t("info.sites.col.levels"))
+        tree.heading("chance", text=self.t("info.sites.col.rarity"))
         tree.column("method", width=120, anchor="w", stretch=False)
         tree.column("region", width=120, anchor="w", stretch=False)
         tree.column("version", width=120, anchor="w", stretch=False)
@@ -2980,10 +4454,10 @@ class App(tk.Tk):
         if not paths:
             tk.Label(
                 frame,
-                text="Sin evolución.",
+                text=self.t("info.evo.none"),
                 bg=self.theme["panel"],
                 fg=self.theme["muted"],
-                font=("Segoe UI", 11),
+                font=(self._ui_font_family, 11),
             ).pack(expand=True, pady=24)
             return
 
@@ -3025,26 +4499,26 @@ class App(tk.Tk):
                     text=step.get("name", "—"),
                     fill=self.theme["fg"],
                     anchor="center",
-                    font=("Segoe UI", 10, "bold"),
+                    font=(self._ui_font_family, 10, "bold"),
                     width=126,
                 )
                 c.create_text(
                     x + 122,
                     y + 68,
-                    text=step.get("trigger_text", "") if i > 0 else "Base",
+                    text=step.get("trigger_text", "") if i > 0 else self.t("info.evo.base"),
                     fill=self.theme["muted"],
                     anchor="center",
-                    font=("Segoe UI", 9),
+                    font=(self._ui_font_family, 9),
                     width=126,
                 )
                 if i > 0:
-                    trigger = step.get("trigger_text", "") or "Evolución"
+                    trigger = step.get("trigger_text", "") or self.t("info.evo.trigger")
                     sx = x - (step_x - node_w) + 10
                     ex = x - 8
                     cy = y + node_h // 2
                     c.create_line(sx, cy, ex, cy, fill=self.theme["edge_nature"], width=2)
-                    c.create_text((sx + ex) // 2, cy - 15, text=trigger, fill=self.theme["muted"], font=("Segoe UI", 9))
-                    c.create_text(ex + 2, cy, text=">", fill=self.theme["edge_nature"], font=("Segoe UI", 10, "bold"), anchor="w")
+                    c.create_text((sx + ex) // 2, cy - 15, text=trigger, fill=self.theme["muted"], font=(self._ui_font_family, 9))
+                    c.create_text(ex + 2, cy, text=">", fill=self.theme["edge_nature"], font=(self._ui_font_family, 10, "bold"), anchor="w")
 
         total_w = base_x + (max_len * step_x) + 40
         total_h = base_y + (len(paths) * row_h) + 40
@@ -3082,7 +4556,8 @@ class App(tk.Tk):
 
     def _show_default_sprite(self):
         try:
-            img = Image.open(self.sprites.get_default_path()).convert("RGBA").resize((96, 96), Image.NEAREST)
+            img = Image.open(self.sprites.get_default_path())
+            img = self._compose_sprite_on_bg(img, (96, 96), bg_hex=self.theme["panel"])
             self._sprite_img = ImageTk.PhotoImage(img)
             self.sprite_label.configure(image=self._sprite_img)
         except Exception as exc:
@@ -3123,38 +4598,29 @@ class App(tk.Tk):
                 self._everstone_icon = ImageTk.PhotoImage(everstone_icon)
             except Exception as exc:
                 print(f"[App] Failed to convert everstone icon: {exc}")
-        self._recompute()
+        self._request_recompute(reason="icons")
 
-    def _load_sprite_async(self, pid: int):
+    def _load_sprite_async(self, pid: int, selection_gen: Optional[int] = None):
         def task():
             path = self.sprites.get_sprite_path(pid)
             try:
-                img = Image.open(path).convert("RGBA")
+                img = Image.open(path)
             except Exception as exc:
                 print(f"[App] Failed to open sprite at {path}: {exc}")
-                img = Image.new("RGBA", (96, 96), (30, 30, 30, 255))
-            img = img.resize((96, 96), Image.NEAREST)
+                try:
+                    img = Image.open(self.sprites.get_default_path())
+                except Exception:
+                    img = Image.new("RGBA", (96, 96), (0, 0, 0, 0))
+            img = self._compose_sprite_on_bg(img, (96, 96), bg_hex=self.theme["panel"])
             def apply():
-                def _animate_scale(step=0):
-                    # Animate from 0.5x to 1.1x to 1.0x scale
-                    scales = [0.5, 0.7, 0.9, 1.1, 1.0]
-                    if step >= len(scales):
-                        return
-                    current_scale = scales[step]
-                    size = int(96 * current_scale)
-                    
-                    try:
-                        scaled_img = img.resize((size, size), Image.NEAREST)
-                        tk_img = ImageTk.PhotoImage(scaled_img)
-                        self._sprite_img = tk_img  # Keep reference
-                        self.sprite_label.configure(image=tk_img)
-                    except Exception as exc:
-                        print(f"[App] Failed to animate sprite for #{pid}: {exc}")
-                        return
-                    
-                    self.after(30, lambda: _animate_scale(step + 1))
-
-                self.after(0, lambda: _animate_scale(0))
+                if selection_gen is not None and selection_gen != self._selection_generation_id:
+                    return
+                try:
+                    tk_img = ImageTk.PhotoImage(img)
+                    self._sprite_img = tk_img  # Keep reference
+                    self.sprite_label.configure(image=tk_img)
+                except Exception as exc:
+                    print(f"[App] Failed to set sprite for #{pid}: {exc}")
             self.after(0, apply)
         threading.Thread(target=task, daemon=True).start()
 
@@ -3198,78 +4664,400 @@ class App(tk.Tk):
 
     def _redraw_last_plan(self):
         self._resize_after_id = None
-        if self._last_plan is not None:
-            self._draw_layers(self._last_plan)
+        if self._last_plan is None or self._render_inflight:
+            return
+        try:
+            gen_id = self._render_generation_id
+            model = self._build_render_model(self._last_plan, max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height()))
+            meta = self._last_render_meta or {}
+            self._apply_render_model(
+                gen_id,
+                model,
+                self._last_plan,
+                keep_status=True,
+                inv_assignments=meta.get("inv_assignments"),
+                allow_compat=meta.get("allow_compat"),
+            )
+        except Exception as exc:
+            LOGGER.debug("Resize redraw failed: %s", exc)
 
     # ---------- Compute ----------
     def _recompute(self):
+        self._request_recompute(reason="direct")
+
+    def _set_recompute_inputs_state(self, enabled: bool) -> None:
+        state = "normal" if enabled else "disabled"
+        for btn in self._iv_buttons.values():
+            try:
+                btn.configure(state=state)
+            except Exception:
+                pass
+        if hasattr(self, "nature_combo"):
+            try:
+                if self._use_ctk:
+                    self.nature_combo.configure(state=state)
+                else:
+                    self.nature_combo.configure(state="readonly" if enabled else "disabled")
+            except Exception:
+                pass
+        if hasattr(self, "compatible_cb"):
+            try:
+                self.compatible_cb.configure(state=state)
+            except Exception:
+                pass
+
+    def _request_recompute(self, reason: str = "ui"):
+        LOGGER.debug(
+            "Recompute request: reason=%s selected=%s ivs=%s nature=%s",
+            reason,
+            bool(self.selected),
+            {s: self.iv_vars[s].get() for s in STATS},
+            self.nature_var.get(),
+        )
+        if self._recompute_after_id:
+            try:
+                self.after_cancel(self._recompute_after_id)
+            except Exception:
+                pass
+            self._recompute_after_id = None
         if not self.selected:
             self._render_empty()
             return
+        self._recompute_after_id = self.after(self._recompute_debounce_ms, lambda: self._start_recompute(reason))
+
+    def _start_recompute(self, reason: str = "debounced"):
+        self._recompute_after_id = None
+        if not self.selected:
+            self._render_empty()
+            return
+        gen_id = self._render_generation_id + 1
+        self._render_generation_id = gen_id
+        self._render_inflight = True
+        self._set_status("status.calculating", is_key=True)
         req = BreedingRequest(
             pokemon=self.selected,
             desired_31={s: self.iv_vars[s].get() for s in STATS},
             desired_nature=self.nature_var.get().strip() or NATURE_NONE,
             keep_nature=False
         )
+        view_w = max(1, self.canvas.winfo_width())
+        view_h = max(1, self.canvas.winfo_height())
+        LOGGER.debug(
+            "Render start: gen=%s reason=%s view=(%s,%s) req_ivs=%s nature=%s",
+            gen_id,
+            reason,
+            view_w,
+            view_h,
+            req.desired_31,
+            req.desired_nature,
+        )
+        threading.Thread(target=self._compute_plan_and_model, args=(gen_id, req, view_w, view_h), daemon=True).start()
+
+    def _compute_plan_and_model(self, gen_id: int, req: BreedingRequest, view_w: int, view_h: int):
         try:
-            gender_rate = self.species_info.get_gender_rate(self.selected.id)
-            ratio_label, gender_costs = self.species_info.classify_gender_cost(gender_rate)
+            try:
+                gender_rate = self.species_info.get_gender_rate(req.pokemon.id)
+                ratio_label, gender_costs = self.species_info.classify_gender_cost(gender_rate)
+            except Exception as exc:
+                LOGGER.debug("Gender ratio lookup failed for #%s: %s", req.pokemon.id, exc)
+                ratio_label, gender_costs = ("?", GENDER_COST_50_50)
+            LOGGER.debug("Compute plan start: gen=%s", gen_id)
+            plan = self.engine.build_plan(req, gender_costs=gender_costs, ratio_label=ratio_label)
+            model = self._build_render_model(plan, view_w, view_h)
+            if not model.get("positions"):
+                raise RuntimeError(self.t("error.no_route"))
+            self.after(0, lambda: self._on_compute_success(gen_id, req, plan, ratio_label, gender_costs, model))
         except Exception as exc:
-            print(f"[SpeciesInfoService] Failed to load gender_rate for #{self.selected.id}: {exc}")
-            ratio_label, gender_costs = ("?", GENDER_COST_50_50)
-        plan = self.engine.build_plan(req, gender_costs=gender_costs, ratio_label=ratio_label)
-        self._render_plan(req, plan, ratio_label, gender_costs)
+            tb = traceback.format_exc()
+            self.after(0, lambda: self._on_compute_error(gen_id, exc, tb))
+
+    def _on_compute_error(self, gen_id: int, exc: Exception, tb: str):
+        LOGGER.debug("Compute/render error gen=%s current=%s err=%s\n%s", gen_id, self._render_generation_id, exc, tb)
+        if gen_id != self._render_generation_id:
+            LOGGER.debug("Ignoring stale compute error gen=%s current=%s", gen_id, self._render_generation_id)
+            return
+        self._render_inflight = False
+        self._set_status("status.failed_keep_previous", is_key=True, err=str(exc))
+
+    def _on_compute_success(
+        self,
+        gen_id: int,
+        req: BreedingRequest,
+        plan: BreedingPlan,
+        ratio_label: str,
+        gender_costs: Dict[str, int],
+        model: Dict[str, object],
+    ):
+        if gen_id != self._render_generation_id:
+            LOGGER.debug("Ignoring stale compute success gen=%s current=%s", gen_id, self._render_generation_id)
+            return
+        try:
+            inv_report = self._match_inventory_for_plan(req, plan)
+            if gen_id != self._render_generation_id:
+                LOGGER.debug("Inventory match became stale gen=%s current=%s", gen_id, self._render_generation_id)
+                return
+            inv_assignments = dict(getattr(inv_report, "node_assignments", {}) or {})
+            allow_compat = bool(self.compatible_var.get())
+
+            self._render_plan(req, plan, ratio_label, gender_costs, inv_report=inv_report)
+            if gen_id != self._render_generation_id:
+                LOGGER.debug("Render plan became stale gen=%s current=%s", gen_id, self._render_generation_id)
+                return
+
+            if not self._apply_render_model(
+                gen_id,
+                model,
+                plan,
+                inv_assignments=inv_assignments,
+                allow_compat=allow_compat,
+            ):
+                raise RuntimeError(self.t("error.stale_render"))
+
+            self._last_inventory_report = inv_report
+            self._last_plan = plan
+            self._last_render_meta = {
+                "req": req,
+                "ratio_label": ratio_label,
+                "gender_costs": gender_costs,
+                "model": model,
+                "inv_assignments": inv_assignments,
+                "allow_compat": allow_compat,
+            }
+            self._set_status("status.ready", is_key=True, version=APP_VERSION)
+        except Exception as exc:
+            LOGGER.debug("Apply render failed gen=%s: %s\n%s", gen_id, exc, traceback.format_exc())
+            self._set_status("status.failed_keep_previous", is_key=True, err=str(exc))
+        finally:
+            self._render_inflight = False
+
+    def _build_render_model(self, plan: BreedingPlan, view_w: int, view_h: int) -> Dict[str, object]:
+        active_nodes = self._collect_active_nodes(plan)
+        layout = self._build_render_layout(plan, active_nodes, view_w, view_h)
+        model = {
+            "active_nodes": active_nodes,
+            "positions": layout["positions"],
+            "content_w": layout["content_w"],
+            "content_h": layout["content_h"],
+            "margin_y": layout["margin_y"],
+            "junction_x": layout["junction_x"],
+            "fusion_points": layout.get("fusion_points", {}),
+        }
+        LOGGER.debug(
+            "Render model built: nodes=%s edges=%s active_layers=%s",
+            len(model["positions"]),
+            len(plan.connections),
+            ",".join(f"{li+1}:{len(idxs)}" for li, idxs in sorted(active_nodes.items())),
+        )
+        return model
 
     # ---------- Render ----------
     def _render_empty(self):
+        self._render_generation_id += 1
+        self._render_inflight = False
         self.cost_title.configure(text="—")
         self.cost_details.configure(text="")
-        self.canvas.delete("all")
+        self.canvas.delete(self._graph_tag)
         self.canvas.configure(scrollregion=(0, 0, 1, 1))
         self._last_plan = None
+        self._last_render_meta = None
+        self._last_inventory_report = None
         self._zoom_scale = 1.0
         self._view_state = {"x_frac": 0.0, "y_frac": 0.0, "zoom": 1.0}
         self.gender_box.delete("1.0", tk.END)
         self.notes_box.delete("1.0", tk.END)
+        self._set_status("status.empty", is_key=True)
 
-    def _render_plan(self, req: BreedingRequest, plan: BreedingPlan, ratio_label: str, gender_costs: Dict[str, int]):
+    @staticmethod
+    def _nature_key(nature_text: str) -> str:
+        raw = (nature_text or "").strip()
+        if not raw or raw == NATURE_NONE:
+            return ""
+        return raw.split("(", 1)[0].strip()
+
+    def _build_inventory_requirements(self, req: BreedingRequest, plan: BreedingPlan) -> List[InventoryRequirement]:
+        source_nodes = {(pl, pi) for (pl, pi), _ in plan.connections}
+        nature_name = self._nature_key(req.desired_nature)
+        try:
+            req_egg_groups = tuple(self.species_info.get_egg_groups(req.pokemon.id))
+        except Exception:
+            req_egg_groups = tuple()
+        out: List[InventoryRequirement] = []
+        for li, layer in enumerate(plan.node_layers):
+            for ni, node in enumerate(layer):
+                if (li, ni) not in source_nodes:
+                    continue
+                out.append(
+                    InventoryRequirement(
+                        node_key=(li, ni),
+                        species_id=req.pokemon.id,
+                        species_name=req.pokemon.name,
+                        egg_groups=req_egg_groups,
+                        gender=node.gender,
+                        ivs31=tuple(sorted({normalize_stat_key(s) for s in node.ivs if normalize_stat_key(s)})),
+                        has_nature=bool(node.has_nature),
+                        nature=nature_name if node.has_nature else "",
+                    )
+                )
+        return out
+
+    def _match_inventory_for_plan(self, req: BreedingRequest, plan: BreedingPlan):
+        requirements = self._build_inventory_requirements(req, plan)
+        report = self.inventory_matcher.match(
+            requirements=requirements,
+            items=self.inventory_items,
+            settings=self.inventory_settings,
+            allow_compatible=bool(self.compatible_var.get()),
+        )
+        return report
+
+    def _inventory_cost_block_text(self, report) -> str:
+        if report is None:
+            return ""
+        est_cost = int(report.estimated_buy_cost_total or 0)
+        total = int((self._last_plan.total_cost if self._last_plan else 0) + est_cost) if self._last_plan else est_cost
+        by_level_lines: List[str] = []
+        for iv_count in range(1, 7):
+            qty = int((report.purchased_by_iv_count or {}).get(iv_count, 0))
+            if qty <= 0:
+                continue
+            unit = int(self.inventory_settings.estimated_buy_price_by_iv_count.get(iv_count, 0) or 0)
+            by_level_lines.append(
+                self.t(
+                    "inventory.purchase_level_line",
+                    level=f"{iv_count}x31",
+                    qty=qty,
+                    unit=f"{unit:,}$",
+                )
+            )
+        by_level_text = ""
+        if by_level_lines:
+            by_level_text = "\n" + self.t("inventory.purchase_breakdown") + "\n" + "\n".join(by_level_lines)
+        return (
+            self.t("inventory.used_count", count=report.inventory_used_count) + "\n" +
+            self.t("inventory.purchased_count", count=report.purchase_count) + "\n" +
+            self.t("inventory.missing_cost", cost=f"{est_cost:,}$") + "\n" +
+            self.t("inventory.total_with_purchases", cost=f"{total:,}$") +
+            by_level_text
+        )
+
+    def _render_plan(
+        self,
+        req: BreedingRequest,
+        plan: BreedingPlan,
+        ratio_label: str,
+        gender_costs: Dict[str, int],
+        inv_report=None,
+    ):
         self.cost_title.configure(text=f"{req.pokemon.name} · {plan.k}x31")
+        if inv_report is None:
+            inv_report = self._match_inventory_for_plan(req, plan)
         total_crosses = plan.breeds_needed
-        nature_line = plan.desired_nature if plan.nature_selected else NATURE_NONE
-        braces_lines = "".join(
-            f"Brazales nivel {lvl}: {qty} ({BRACE_COST:,}$ c/u)\n"
+        nature_line = plan.desired_nature if plan.nature_selected else self.t("nature.none")
+        braces_lines = "\n".join(
+            self.t("cost.braces_line", level=lvl, qty=qty, unit=f"{BRACE_COST:,}$")
             for lvl, qty in plan.braces_by_level
         )
+        if braces_lines:
+            braces_lines += "\n"
+        inventory_estimated = int(inv_report.estimated_buy_cost_total if inv_report else 0)
+        total_with_inventory = int(plan.total_cost + inventory_estimated)
+        inv_by_level_lines: List[str] = []
+        if inv_report is not None:
+            for iv_count in range(1, 7):
+                qty = int((inv_report.purchased_by_iv_count or {}).get(iv_count, 0))
+                if qty <= 0:
+                    continue
+                unit = int(self.inventory_settings.estimated_buy_price_by_iv_count.get(iv_count, 0) or 0)
+                inv_by_level_lines.append(
+                    self.t(
+                        "inventory.purchase_level_line",
+                        level=f"{iv_count}x31",
+                        qty=qty,
+                        unit=f"{unit:,}$",
+                    )
+                )
+        inv_by_level_text = ""
+        if inv_by_level_lines:
+            inv_by_level_text = "\n" + self.t("inventory.purchase_breakdown") + "\n" + "\n".join(inv_by_level_lines)
         self.cost_details.configure(text=
-            f"Padres base necesarios (1x31): {plan.parents_needed}\n"
-            f"Cruces totales: {total_crosses}\n"
-            f"Naturaleza: {nature_line}\n"
-            f"{braces_lines}"
-            f"Total en Brazales: {plan.braces_cost:,}$ ({plan.braces_needed} braces)\n"
-            f"Gasto en Naturaleza: {plan.everstone_cost:,}$ ({plan.everstone_uses} Everstone @ {EVERSTONE_COST:,}$)\n"
-            f"Pokeballs: {plan.balls_cost:,}$ ({plan.balls_used} x {POKEBALL_COST:,}$)\n"
-            f"Costo de Géneros: {plan.gender_cost_total:,}$\n"
-            f"Género (ratio): {ratio_label}\n"
-            f"Selección género huevos: M={plan.gender_selections.get('M',0)}, F={plan.gender_selections.get('F',0)}\n"
-            f"TOTAL: {plan.total_cost:,}$"
+            self.t("cost.parents_needed", count=plan.parents_needed) + "\n" +
+            self.t("cost.total_crosses", count=total_crosses) + "\n" +
+            self.t("cost.nature", nature=nature_line) + "\n" +
+            f"{braces_lines}" +
+            self.t("cost.braces_total", cost=f"{plan.braces_cost:,}$", qty=plan.braces_needed) + "\n" +
+            self.t("cost.nature_total", cost=f"{plan.everstone_cost:,}$", qty=plan.everstone_uses, each=f"{EVERSTONE_COST:,}$") + "\n" +
+            self.t("cost.balls_total", cost=f"{plan.balls_cost:,}$", qty=plan.balls_used, each=f"{POKEBALL_COST:,}$") + "\n" +
+            self.t("cost.gender_total", cost=f"{plan.gender_cost_total:,}$") + "\n" +
+            self.t("cost.ratio", ratio=ratio_label) + "\n" +
+            self.t("cost.gender_selections", m=plan.gender_selections.get('M', 0), f=plan.gender_selections.get('F', 0)) + "\n" +
+            self.t("cost.total", cost=f"{plan.total_cost:,}$") + "\n\n" +
+            self.t("inventory.used_count", count=(inv_report.inventory_used_count if inv_report else 0)) + "\n" +
+            self.t("inventory.purchased_count", count=(inv_report.purchase_count if inv_report else 0)) + "\n" +
+            self.t("inventory.missing_cost", cost=f"{inventory_estimated:,}$") + "\n" +
+            self.t("inventory.total_with_purchases", cost=f"{total_with_inventory:,}$") +
+            inv_by_level_text
         )
-        self._last_plan = plan
-        self._draw_layers(plan)
         # Género details
         self.gender_box.delete("1.0", tk.END)
-        self.gender_box.insert(tk.END, f"Costos por selección (según ratio {ratio_label}):\n")
-        self.gender_box.insert(tk.END, f"  Macho: {gender_costs.get('M',0):,}$\n")
-        self.gender_box.insert(tk.END, f"  Hembra: {gender_costs.get('F',0):,}$\n\n")
-        self.gender_box.insert(tk.END, "Capas y parejas necesarias:\n")
+        self.gender_box.insert(tk.END, self.t("gender.selection_costs", ratio=ratio_label) + "\n")
+        self.gender_box.insert(tk.END, self.t("gender.male_cost", cost=f"{gender_costs.get('M', 0):,}$") + "\n")
+        self.gender_box.insert(tk.END, self.t("gender.female_cost", cost=f"{gender_costs.get('F', 0):,}$") + "\n\n")
+        self.gender_box.insert(tk.END, self.t("gender.layers_header") + "\n")
         for gl in plan.gender_layers:
-            tag = " (seleccionable)" if gl.selectable else ""
-            self.gender_box.insert(tk.END, f"• {gl.label}: total {gl.count} → {gl.need_m} Machos + {gl.need_f} Hembras{tag}\n")
-        self.gender_box.insert(tk.END, "\nRecuerda: en cada cruce ambos padres desaparecen y solo queda el huevo.\n")
+            tag = f" {self.t('gender.selectable')}" if gl.selectable else ""
+            self.gender_box.insert(tk.END, self.t("gender.layer_line", label=gl.label, total=gl.count, m=gl.need_m, f=gl.need_f, tag=tag) + "\n")
+        self.gender_box.insert(tk.END, "\n" + self.t("gender.reminder") + "\n")
         # Notes
         self.notes_box.delete("1.0", tk.END)
         for n in plan.notes:
-            self.notes_box.insert(tk.END, f"• {n}\n")
+            self.notes_box.insert(tk.END, f"• {self._translate_note_line(n)}\n")
+        self.notes_box.insert(
+            tk.END,
+            f"• {self.t('inventory.note', used=(inv_report.inventory_used_count if inv_report else 0), missing=(inv_report.purchase_count if inv_report else 0), compat=(self.t('inventory.compat_on') if self.compatible_var.get() else self.t('inventory.compat_off')))}\n"
+        )
+
+    def _apply_render_model(
+        self,
+        gen_id: int,
+        model: Dict[str, object],
+        plan: BreedingPlan,
+        keep_status: bool = False,
+        inv_assignments: Optional[Dict[Tuple[int, int], str]] = None,
+        allow_compat: Optional[bool] = None,
+    ) -> bool:
+        if gen_id != self._render_generation_id:
+            LOGGER.debug("Skipping stale apply: gen=%s current=%s", gen_id, self._render_generation_id)
+            return False
+        ok = self._draw_layers(
+            plan,
+            model=model,
+            gen_id=gen_id,
+            inv_assignments=inv_assignments,
+            allow_compat=allow_compat,
+        )
+        if ok and not keep_status:
+            self._set_status("status.rendered", is_key=True, gen=gen_id)
+        return ok
+
+    def _translate_note_line(self, note: str) -> str:
+        note = (note or "").strip()
+        mapping = {
+            "Cada cruce consume a ambos padres y solo queda el huevo.": "notes.cross_consumes",
+            "Braces: 2 por cruce; si un padre lleva naturaleza, usa Everstone en lugar de brace.": "notes.braces_rule",
+            "Base (1x31) NO puede seleccionar género con NPC: se requieren M/H necesarios.": "notes.base_gender",
+            "En capas intermedias se selecciona el género del huevo para garantizar parejas.": "notes.intermediate_gender",
+        }
+        if note.startswith("Género (según species): ratio "):
+            ratio = note.replace("Género (según species): ratio ", "").rstrip(".")
+            return self.t("notes.gender_ratio", ratio=ratio)
+        if note.startswith("Insumos: ") and "Pokéballs usadas" in note:
+            m = re.search(r"Insumos:\s*(\d+)", note)
+            balls = m.group(1) if m else "0"
+            return self.t("notes.balls_used", count=balls)
+        if note.startswith("Naturaleza fijada desde base y propagada con Piedra Eterna"):
+            return self.t("notes.nature_fix", cost=f"{EVERSTONE_COST:,}")
+        key = mapping.get(note)
+        return self.t(key) if key else note
 
     def _collect_active_nodes(self, plan: BreedingPlan) -> Dict[int, List[int]]:
         layer_count = len(plan.node_layers)
@@ -3426,12 +5214,12 @@ class App(tk.Tk):
                     if level > 1:
                         fusion_points[(li, nat_idx)] = (x0_col - 42.0, center_y)
 
-            print(
-                "[Layout] active:",
+            LOGGER.debug(
+                "Layout active: %s",
                 ", ".join(f"{li+1}x31={len(active_nodes.get(li, []))}" for li in range(layer_count)),
             )
-            print("[Layout] tree roots:", ", ".join(f"T{tid}={root_y.get(tid, 0):.1f}" for tid in ordered_trees))
-            print("[Layout] nature y:", ", ".join(f"L{lvl}={nature_y[lvl]:.1f}" for lvl in sorted(nature_y)))
+            LOGGER.debug("Layout tree roots: %s", ", ".join(f"T{tid}={root_y.get(tid, 0):.1f}" for tid in ordered_trees))
+            LOGGER.debug("Layout nature y: %s", ", ".join(f"L{lvl}={nature_y[lvl]:.1f}" for lvl in sorted(nature_y)))
         else:
             # Regular bracket (pure mode).
             for li, layer in enumerate(plan.node_layers):
@@ -3482,7 +5270,7 @@ class App(tk.Tk):
                     continue
                 overlaps += 1
         if overlaps:
-            print(f"[Layout] overlap warnings: {overlaps}")
+            LOGGER.debug("Layout overlap warnings: %s", overlaps)
 
         return {
             "positions": positions,
@@ -3533,115 +5321,173 @@ class App(tk.Tk):
             if kind in ("nature_spine", "fusion") and child_key in fusion_points:
                 fx, fy = fusion_points[child_key]
                 sx = pbox[2] if parent_key[0] < child_key[0] else pbox[0]
-                self.canvas.create_line(sx, py, fx, py, fill=color, width=width, tags=("edge",))
-                self.canvas.create_line(fx, py, fx, fy, fill=color, width=width, tags=("edge",))
-                self.canvas.create_line(fx, fy, cbox[0], cy, fill=color, width=width, tags=("edge",))
+                self.canvas.create_line(sx, py, fx, py, fill=color, width=width, tags=(self._graph_tag, "edge"))
+                self.canvas.create_line(fx, py, fx, fy, fill=color, width=width, tags=(self._graph_tag, "edge"))
+                self.canvas.create_line(fx, fy, cbox[0], cy, fill=color, width=width, tags=(self._graph_tag, "edge"))
             else:
                 sx = pbox[2]
                 ex = cbox[0]
                 jx = junction_x.get(child_key[0], (sx + ex) / 2.0)
                 jx = min(max(jx, sx + 14.0), ex - 14.0)
-                self.canvas.create_line(sx, py, jx, py, fill=color, width=width, tags=("edge",))
-                self.canvas.create_line(jx, py, jx, cy, fill=color, width=width, tags=("edge",))
-                self.canvas.create_line(jx, cy, ex, cy, fill=color, width=width, tags=("edge",))
+                self.canvas.create_line(sx, py, jx, py, fill=color, width=width, tags=(self._graph_tag, "edge"))
+                self.canvas.create_line(jx, py, jx, cy, fill=color, width=width, tags=(self._graph_tag, "edge"))
+                self.canvas.create_line(jx, cy, ex, cy, fill=color, width=width, tags=(self._graph_tag, "edge"))
 
-    def _draw_layers(self, plan: BreedingPlan):
+    def _draw_layers(
+        self,
+        plan: BreedingPlan,
+        model: Optional[Dict[str, object]] = None,
+        gen_id: Optional[int] = None,
+        inv_assignments: Optional[Dict[Tuple[int, int], str]] = None,
+        allow_compat: Optional[bool] = None,
+    ) -> bool:
+        if gen_id is not None and gen_id != self._render_generation_id:
+            LOGGER.debug("Draw aborted by stale generation: draw=%s current=%s", gen_id, self._render_generation_id)
+            return False
         prev_view = self._capture_canvas_view_state()
-        self.canvas.delete("all")
         if not plan.node_layers:
-            return
+            return False
+        if model is None:
+            model = self._build_render_model(plan, max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height()))
+
+        active_nodes: Dict[int, List[int]] = model.get("active_nodes", {})  # type: ignore[assignment]
+        positions: Dict[Tuple[int, int], Tuple[float, float, float, float]] = model.get("positions", {})  # type: ignore[assignment]
+        if not positions:
+            return False
+        content_w = float(model.get("content_w", max(1, self.canvas.winfo_width())))
+        content_h = float(model.get("content_h", max(1, self.canvas.winfo_height())))
+        margin_y = float(model.get("margin_y", 24.0))
+        junction_x: Dict[int, float] = model.get("junction_x", {})  # type: ignore[assignment]
+        fusion_points: Dict[Tuple[int, int], Tuple[float, float]] = model.get("fusion_points", {})  # type: ignore[assignment]
+
+        self.canvas.delete(self._graph_tag)
         self._zoom_scale = 1.0
-
-        view_w = max(1, self.canvas.winfo_width())
-        view_h = max(1, self.canvas.winfo_height())
-        active_nodes = self._collect_active_nodes(plan)
-        layout = self._build_render_layout(plan, active_nodes, view_w, view_h)
-        positions = layout["positions"]
-        content_w = layout["content_w"]
-        content_h = layout["content_h"]
-        margin_y = layout["margin_y"]
-        junction_x = layout["junction_x"]
-        fusion_points = layout.get("fusion_points", {})
-
         self.canvas.configure(scrollregion=(0, 0, content_w, content_h))
         self._draw_canvas_background(content_w, content_h)
 
         for layer_idx, layer_nodes in enumerate(plan.node_layers):
             vis_indices = active_nodes.get(layer_idx, list(range(len(layer_nodes))))
-            x0_col = min(
-                (positions[(layer_idx, idx)][0] for idx in vis_indices if (layer_idx, idx) in positions),
-                default=38.0,
-            )
+            x0_col = min((positions[(layer_idx, idx)][0] for idx in vis_indices if (layer_idx, idx) in positions), default=38.0)
             self.canvas.create_text(
-                x0_col, margin_y + 2, anchor="nw", fill=self.theme["muted"],
-                text=f"{layer_idx + 1}x31 ({len(vis_indices)})"
+                x0_col,
+                margin_y + 2,
+                anchor="nw",
+                fill=self.theme["muted"],
+                text=self.t("graph.layer_header", level=layer_idx + 1, count=len(vis_indices)),
+                font=(self._ui_font_family, 10),
+                tags=(self._graph_tag, "label"),
             )
 
         self._draw_connections_from_layout(plan, positions, junction_x, fusion_points)
         source_nodes = {(pl, pi) for (pl, pi), _ in plan.connections}
+        if inv_assignments is None:
+            inv_assignments = {}
+            if self._last_inventory_report is not None:
+                inv_assignments = dict(getattr(self._last_inventory_report, "node_assignments", {}) or {})
+        compat_enabled = bool(self.compatible_var.get()) if allow_compat is None else bool(allow_compat)
 
-        def _draw_single_layer(layer_idx: int):
-            if layer_idx >= len(plan.node_layers):
-                bbox = self.canvas.bbox("all")
-                if bbox:
-                    self.canvas.configure(scrollregion=(bbox[0] - 80, bbox[1] - 80, bbox[2] + 80, bbox[3] + 80))
-                    self._restore_canvas_view_state(prev_view)
-                    self._view_state = self._capture_canvas_view_state()
-                return
-
-            layer_nodes = plan.node_layers[layer_idx]
+        for layer_idx, layer_nodes in enumerate(plan.node_layers):
             for node_idx in active_nodes.get(layer_idx, list(range(len(layer_nodes)))):
+                if gen_id is not None and gen_id != self._render_generation_id:
+                    LOGGER.debug("Node draw interrupted: draw=%s current=%s", gen_id, self._render_generation_id)
+                    return False
                 node = layer_nodes[node_idx]
                 if (layer_idx, node_idx) not in positions:
                     continue
                 x0, y0, x1, y1 = positions[(layer_idx, node_idx)]
                 node_is_source = (layer_idx, node_idx) in source_nodes
                 node_fill = self.theme["nature_fill"] if node.has_nature else self.theme["node_fill"]
-                # subtle shadow
-                self.canvas.create_rectangle(x0 + 2, y0 + 2, x1 + 2, y1 + 2, outline="", fill="#0B0E13", tags=("node",))
-                self._create_round_rect(x0, y0, x1, y1, radius=10, outline=self.theme["border"], fill=node_fill, width=1, tags=("node",))
+                inv_assigned = (layer_idx, node_idx) in inv_assignments
+                border_color = "#36D37E" if inv_assigned else self.theme["border"]
+                border_width = 2 if inv_assigned else 1
+                node_tag = f"node:{layer_idx}:{node_idx}"
+                node_tags = (self._graph_tag, "node", node_tag)
+                self.canvas.create_rectangle(
+                    x0 + 2,
+                    y0 + 2,
+                    x1 + 2,
+                    y1 + 2,
+                    outline="",
+                    fill=self.theme["node_shadow"],
+                    tags=node_tags,
+                )
+                self._create_round_rect(x0, y0, x1, y1, radius=10, outline=border_color, fill=node_fill, width=border_width, tags=node_tags)
+                self._draw_colored_ivs((x0 + x1) / 2, y0 + 40, node.ivs, tags=node_tags)
 
-                self._draw_colored_ivs((x0 + x1) / 2, y0 + 40, node.ivs, tags=("node",))
-
-                # Gender badge.
                 gsym = "♂" if node.gender == "M" else "♀"
                 gcol = "#60A5FA" if node.gender == "M" else "#F472B6"
-                self.canvas.create_text(x1 - 8, y0 + 8, text=gsym, fill=gcol, anchor="ne", font=("Segoe UI", 10, "bold"), tags=("node",))
+                self.canvas.create_text(x1 - 8, y0 + 8, text=gsym, fill=gcol, anchor="ne", font=(self._ui_font_family, 10, "bold"), tags=node_tags)
 
-                if self.compatible_var.get() and not node.is_nature_branch:
-                    self.canvas.create_text(x0 + 8, y0 + 8, text="Compat", fill="#A5B4FC", anchor="nw", font=("Segoe UI", 7), tags=("node",))
-
-                # Held item icon (brace or everstone) for next cross.
                 if node_is_source and node.item:
                     if node.item == "EVERSTONE":
-                        self.canvas.create_text((x0 + x1) / 2, y0 + 8, text=f"${EVERSTONE_COST//1000}k", fill="#FDE68A", font=("Segoe UI", 7, "bold"), tags=("node",))
+                        self.canvas.create_text((x0 + x1) / 2, y0 + 8, text=f"${EVERSTONE_COST//1000}k", fill="#FDE68A", font=(self._ui_font_family, 7, "bold"), tags=(self._graph_tag, "node"))
                         if self._everstone_icon:
-                            self.canvas.create_image((x0 + x1) / 2, y0 + 21, image=self._everstone_icon, anchor="center", tags=("node",))
+                            self.canvas.create_image((x0 + x1) / 2, y0 + 21, image=self._everstone_icon, anchor="center", tags=node_tags)
                         else:
-                            self.canvas.create_text((x0 + x1) / 2, y0 + 21, text="E", fill="#FDE68A", font=("Segoe UI", 9, "bold"), tags=("node",))
+                            self.canvas.create_text((x0 + x1) / 2, y0 + 21, text="E", fill="#FDE68A", font=(self._ui_font_family, 9, "bold"), tags=node_tags)
                     else:
-                        self.canvas.create_text((x0 + x1) / 2, y0 + 8, text=f"${BRACE_COST//1000}k", fill="#E2E8F0", font=("Segoe UI", 7, "bold"), tags=("node",))
+                        self.canvas.create_text((x0 + x1) / 2, y0 + 8, text=f"${BRACE_COST//1000}k", fill="#E2E8F0", font=(self._ui_font_family, 7, "bold"), tags=node_tags)
                         icon = self._brace_icons.get(node.item)
                         if icon:
-                            self.canvas.create_image((x0 + x1) / 2, y0 + 21, image=icon, anchor="center", tags=("node",))
+                            self.canvas.create_image((x0 + x1) / 2, y0 + 21, image=icon, anchor="center", tags=node_tags)
 
                 if node.has_nature:
-                    self.canvas.create_text((x0 + x1) / 2, y0 - 8, fill="#FDE68A", text="(Naturaleza)", font=("Segoe UI", 7, "bold"), tags=("node",))
+                    self.canvas.create_text((x0 + x1) / 2, y0 - 8, fill="#FDE68A", text=self.t("graph.nature"), font=(self._ui_font_family, 7, "bold"), tags=node_tags)
+                status_parts: List[str] = []
+                if node_is_source:
+                    status_parts.append(self.t("graph.inv") if inv_assigned else self.t("graph.buy"))
+                if compat_enabled and not node.is_nature_branch:
+                    status_parts.append(self.t("graph.compat"))
+                if status_parts:
+                    if node_is_source and inv_assigned:
+                        status_color = "#36D37E"
+                    elif node_is_source:
+                        status_color = self.theme["muted"]
+                    else:
+                        status_color = self.theme["accent"]
+                    self.canvas.create_text(
+                        x0 + 8,
+                        y0 + 8,
+                        text=" · ".join(status_parts),
+                        fill=status_color,
+                        anchor="nw",
+                        font=(self._ui_font_family, 6, "bold" if node_is_source else "normal"),
+                        tags=node_tags,
+                    )
+                if node_is_source:
+                    self.canvas.tag_bind(node_tag, "<Button-3>", lambda _e, key=(layer_idx, node_idx): self._show_inventory_assignment(key))
 
-                # Micro-cost footer (Excel-like): ball + gender where applies.
                 footer_parts = []
                 if node.cost_ball > 0:
-                    footer_parts.append(f"Ball ${POKEBALL_COST}")
+                    footer_parts.append(self.t("graph.ball", cost=POKEBALL_COST))
                 if node.cost_gender > 0:
-                    footer_parts.append(f"Gen ${node.cost_gender:,}")
+                    footer_parts.append(self.t("graph.gender", cost=f"{node.cost_gender:,}"))
                 if footer_parts:
-                    self.canvas.create_text((x0 + x1) / 2, y1 - 8, text=" | ".join(footer_parts), fill=self.theme["muted"], font=("Segoe UI", 7), tags=("node",))
+                    self.canvas.create_text((x0 + x1) / 2, y1 - 8, text=" | ".join(footer_parts), fill=self.theme["muted"], font=(self._ui_font_family, 7), tags=node_tags)
 
-            # Schedule next layer
-            self.after(150, lambda: _draw_single_layer(layer_idx + 1))
+        bbox = self.canvas.bbox(self._graph_tag)
+        if bbox:
+            self.canvas.configure(scrollregion=(bbox[0] - 80, bbox[1] - 80, bbox[2] + 80, bbox[3] + 80))
+            self._restore_canvas_view_state(prev_view)
+            self._view_state = self._capture_canvas_view_state()
+        LOGGER.debug("Render done: gen=%s nodes=%s edges=%s", gen_id if gen_id is not None else self._render_generation_id, len(positions), len(plan.connections))
+        return True
 
-        # Start the animation cascade
-        _draw_single_layer(0)
+    def _show_inventory_assignment(self, node_key: Tuple[int, int]) -> None:
+        report = self._last_inventory_report
+        if report is None:
+            self._set_status("status.rendered", is_key=True)
+            return
+        assigned_id = (report.node_assignments or {}).get(node_key)
+        if not assigned_id:
+            self._set_status(f"{self.t('graph.buy')} · {node_key[0] + 1}x31/{node_key[1] + 1}")
+            return
+        item = next((x for x in self.inventory_items if x.id == assigned_id), None)
+        if item is None:
+            self._set_status(f"{self.t('graph.inv')} · #{assigned_id[:8]}")
+            return
+        iv_text = "+".join(item.ivs_key()) or "-"
+        self._set_status(f"{self.t('graph.inv')} · {item.species_name or '?'} · {item.gender} · {iv_text}")
 
     def _create_round_rect(self, x1, y1, x2, y2, radius=8, **kwargs):
         points = [
@@ -3668,19 +5514,19 @@ class App(tk.Tk):
         base3 = self.theme_manager._mix(self.theme["canvas_bg"], "#000000", 0.20 if self.theme_cfg.mode == "dark" else 0.0)
         for i, color in enumerate([base1, base2, base3]):
             r = max(width, height) * (1.0 - i * 0.2)
-            self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r, fill=color, outline="", tags=("bg",))
+            self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r, fill=color, outline="", tags=(self._graph_tag, "bg"))
         # faint grid
         step = 28
         for x in range(0, int(width), step):
-            self.canvas.create_line(x, 0, x, height, fill=self.theme["grid"], width=1, tags=("bg",))
+            self.canvas.create_line(x, 0, x, height, fill=self.theme["grid"], width=1, tags=(self._graph_tag, "bg"))
         for y in range(0, int(height), step):
-            self.canvas.create_line(0, y, width, y, fill=self.theme["grid"], width=1, tags=("bg",))
+            self.canvas.create_line(0, y, width, y, fill=self.theme["grid"], width=1, tags=(self._graph_tag, "bg"))
 
     def _draw_colored_ivs(self, cx: float, cy: float, iv_tokens: Tuple[str, ...], tags=()):
         tokens = [t for t in iv_tokens if t]
         if not tokens:
             return
-        font = tkfont.Font(family="Segoe UI", size=8, weight="bold")
+        font = tkfont.Font(family=self._ui_font_family, size=8, weight="bold")
         parts: List[Tuple[str, str]] = []
         for i, tok in enumerate(tokens):
             parts.append((tok, IV_COLORS.get(tok, self.theme["fg"])))
@@ -3810,6 +5656,3 @@ if __name__ == "__main__":
         user_assets_dir=ASSETS_DIR,
         enable_updater=True,
     )
-
-
-
